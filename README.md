@@ -136,6 +136,7 @@ docker exec -u abc wechat /lsiopy/bin/python3 /opt/wechat-connector/bridge.py lo
 | `media_dir` | 待发图片、语音的临时目录，默认 `/tmp/wechat-connector-media`，超过 10 分钟的自动清掉 |
 | `voice_mode` | `native`（默认）发原生语音条，失败时退回 mp3 文件；`file` 一律发 mp3 文件 |
 | `max_queue_wait` | 一条消息排队超过这么多秒还没轮到就不发了，默认 150（AstrBot 等回执最多 180 秒，超时后插件可能已经改发文字，再发就重复了） |
+| `max_text_chars` | 一条文字超过这么多字就按换行拆成几条发，默认 1500 |
 | `receive_stickers` | 收别人发的表情包，默认 `true`：按消息里的地址下载原图核对（md5、格式、大小），合格的以图片段交给 AstrBot：格式和 NapCat 一样，`file` 是文件名、`url` 是原图地址 |
 | `group_stickers` | 群里的表情包也收，默认 `true`。AstrBot 不会因为一张表情包就回话（除非被 @ 或引用），但陪伴类插件如果开着「群聊看图」，每张都会多调一次看图模型；想省就设成 `false`，只收私聊的 |
 | `max_sticker_kb` | 超过这么大的表情包不收，默认 5120（5MB） |
@@ -197,6 +198,7 @@ docker exec -u 0 wechat s6-svc -u /run/service/svc-wechat-connector
 - **引用只记在内存里**：被引用的那条最多记 200 条，AstrBot 收到引用回复时马上来取（`get_msg`），平时够用；连接器重启前的引用取不到。她回复时也不会带引用框，发的是普通消息。
 - **语音条按实际时长录**：一段 20 秒的语音要录 20 秒，这期间界面被占着，后面的消息排队。超过 55 秒的切成几条（微信语音条最长 60 秒）。
 - **视频、文件**：AstrBot 发视频、文件时给的是它自己容器里的路径，连接器拿不到，会跳过。
+- **合并转发会拆开发**：微信没有合并转发。AstrBot 遇到长回复会自动打包成合并转发（`send_group_forward_msg` / `send_private_forward_msg`），连接器把各节点的内容取出来按普通消息发，超长文字按 `max_text_chars` 拆成几条。
 - **回复会慢几秒**：会话已经开着时大约 1 秒；要切换会话时 2～6 秒，再加上打字停顿。好几个会话同时要回时排队，一条语音条要占满它的时长，后面的跟着等。
 - **同名的联系人或群会被跳过**：给它们设不同的备注名就行。
 - **@ 只是文字**：回复里的 @ 是「@名字」这样的文字，对方不会收到提醒。

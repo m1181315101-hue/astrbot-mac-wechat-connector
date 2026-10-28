@@ -36,7 +36,7 @@ import media  # noqa: E402
 import onebot  # noqa: E402
 import wxdb  # noqa: E402
 
-VERSION = "0.6.0"
+VERSION = "0.6.1"
 HERE = os.path.dirname(os.path.abspath(__file__))
 # 界面驱动的这些失败都发生在回车之前（回车前核对失败时已经清空输入框），一个字都没发出去，可以重试
 # 发图片后回查数据库确认用：PNG/JPG 存成图片 3，GIF 粘贴后存成动画表情附件 (49, 8)，有时是表情 47
@@ -65,6 +65,7 @@ DEFAULTS = {
     "receive_stickers": True,   # 收别人发的表情包，当成图片交给 AstrBot
     "group_stickers": True,     # 群里的表情包也收（陪伴类插件开着群聊看图时，每张会多一次看图调用）
     "max_sticker_kb": 5120,     # 超过这么大的表情包不收
+    "max_text_chars": 1500,     # 一条文字超过这么多字就按换行拆成几条发
     "max_queue_wait": 150,  # 排队超过这么多秒还没轮到就不发了（AstrBot 等回执最多 180 秒，超时后插件可能已经改发文字）
 }
 
@@ -171,6 +172,46 @@ class UiDriver:
                 self.proc = None
                 return {"ok": False, "reason": "界面驱动无响应"}
             return json.loads(line)
+
+
+FORWARD_ACTIONS = {"send_group_forward_msg": True, "send_private_forward_msg": False}
+
+
+def flatten_forward(messages) -> list[dict]:
+    """合并转发（node 列表）→ 普通消息段：各节点的内容按顺序接起来，节点之间空一行。
+    微信没有合并转发；AstrBot 遇到长回复会自动打包成合并转发，不拆开的话整条都发不出去"""
+    out: list[dict] = []
+    for node in messages or []:
+        if not isinstance(node, dict):
+            continue
+        content = (node.get("data") or {}).get("content")
+        if isinstance(content, str):
+            content = [{"type": "text", "data": {"text": content}}]
+        segs: list[dict] = []
+        for seg in content or []:
+            if isinstance(seg, dict) and seg.get("type") == "node":
+                segs.extend(flatten_forward([seg]))
+            elif isinstance(seg, dict):
+                segs.append(seg)
+        if segs:
+            if out:
+                out.append({"type": "text", "data": {"text": "\n\n"}})
+            out.extend(segs)
+    return out
+
+
+def split_long_text(text: str, limit: int) -> list[str]:
+    """超过 limit 字的文字尽量在换行处切开，切不开就硬切"""
+    chunks = []
+    while len(text) > limit:
+        cut = text.rfind("\n", 0, limit)
+        if cut < limit // 2:
+            cut = limit
+        chunks.append(text[:cut].strip())
+        text = text[cut:].strip()
+    if text:
+        chunks.append(text)
+    return [c for c in chunks if c]
 
 
 def message_parts(message, face_names: dict[str, str], at_name=lambda qq: "") -> tuple[list[tuple[str, str]], list[str]]:
@@ -408,6 +449,12 @@ class Connector:
             wxid = self.state.ids.get(str(params.get("user_id")))
             nick = self.store.display_name(wxid) if wxid else str(params.get("user_id"))
             return "ok", 0, {"user_id": params.get("user_id"), "nickname": nick, "sex": "unknown", "age": 0}
+        if action in FORWARD_ACTIONS:
+            group = FORWARD_ACTIONS[action]
+            nodes = params.get("messages") or []
+            log.info("合并转发（%d 个节点）拆成普通消息发", len(nodes))
+            target = params.get("group_id") if group else params.get("user_id")
+            return await self.send_to(str(target), {"message": flatten_forward(nodes)}, group=group)
         if action == "get_msg":
             msg = self.quoted.get(int(params.get("message_id") or 0))
             return ("ok", 0, msg) if msg else ("failed", 1404, {"message": "只能取到别人引用过的消息"})
@@ -476,6 +523,7 @@ class Connector:
             log.warning("拒绝发送：%s 不在%s白名单", target_id, "群" if group else "")
             return "failed", 1403, {"message": "目标不在白名单"}
         parts, dropped = message_parts(params.get("message"), self.face_names, self._at_name)
+        parts = [(k, c) for k, v in parts for c in (split_long_text(v, self.cfg["max_text_chars"]) if k == "text" else [v])]
         if dropped:
             log.info("丢掉不支持的消息段 %s", dropped)
         if not parts:
