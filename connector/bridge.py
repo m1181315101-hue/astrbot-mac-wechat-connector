@@ -3,6 +3,8 @@
 
 收：轮询本地数据库（wxdb），白名单里的人（私聊；写 "*" 就是所有好友）和白名单里的群发来的新文字 → OneBot 消息事件 → AstrBot
     群里有人 @ 小号时，事件前面加一个 at 段，AstrBot 按「被 @」处理
+    引用回复：事件前面加一个 reply 段，被引用的那条记在内存里，AstrBot 用 get_msg 来取；
+    引用的是小号的话，AstrBot 当成在叫它（和 QQ 上回复机器人的消息一样）
 回：AstrBot 的 send_private_msg / send_group_msg → 发送队列 → 界面驱动（wxui）切换会话、核对、粘贴、回车
     → 回查数据库确认。文字、图片（GIF 是动画表情）、语音（原生语音条，不行就退回 mp3 文件）按原顺序一段一段发
 
@@ -24,14 +26,14 @@ import subprocess
 import sys
 import threading
 import time
-from collections import deque
+from collections import OrderedDict, deque
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 import media  # noqa: E402
 import onebot  # noqa: E402
 import wxdb  # noqa: E402
 
-VERSION = "0.3.0"
+VERSION = "0.4.0"
 HERE = os.path.dirname(os.path.abspath(__file__))
 log = logging.getLogger("wechat-connector")
 
@@ -213,6 +215,7 @@ class Connector:
         self.send_lock = asyncio.Lock()
         self.sent_times: deque[float] = deque()
         self.at_pattern = None  # init_marks 里按小号昵称生成
+        self.quoted: OrderedDict[int, dict] = OrderedDict()  # 被引用的消息，给 get_msg 用
         self.media = media.MediaDir(cfg["media_dir"])
         self.face_names = {}
         if cfg.get("face_map"):
@@ -281,9 +284,12 @@ class Connector:
             return
         if m["type"] != 1 or not m["text"]:
             if m["type"] != 10000:  # 10000 是「某某撤回了一条消息」这类系统提示
-                log.info("跳过 %s 的非文字消息 type=%s（第一阶段只收文字）", cid, m["type"])
+                log.info("跳过 %s 的非文字消息 type=%s（只收文字和引用）", cid, m["type"])
             return
         mid = onebot.stable_id(f"{chat}:{m['local_id']}:{m['time']}")
+        quote = m.get("quote")
+        reply_id = self.remember_quote(chat, quote) if quote else None
+        quote_note = ("，引用了小号的话" if quote["sender"] == self.store.self_wxid else "，引用了一条消息") if quote else ""
         if chat.endswith("@chatroom"):
             sender = m["sender"] or "unknown"
             uid = self.state.id_of(sender)
@@ -291,15 +297,37 @@ class Connector:
             at_self = bool(self.at_pattern and self.at_pattern.search(text))
             if at_self:
                 text = self.at_pattern.sub("", text, count=1).strip()
-            log.info("群 %s 里 %s 发了文字 %d 字%s", cid, uid, len(text), "，@ 了小号" if at_self else "")
+            log.info("群 %s 里 %s 发了文字 %d 字%s%s", cid, uid, len(text), "，@ 了小号" if at_self else "", quote_note)
             event = onebot.group_message_event(self.self_id, cid, uid, self.store.display_name(sender), mid,
-                                               text, at_self, int(m["time"]))
+                                               text, at_self, int(m["time"]), reply_id)
         else:
-            log.info("收到 %s 的私聊文字 %d 字", cid, len(m["text"]))
+            log.info("收到 %s 的私聊文字 %d 字%s", cid, len(m["text"]), quote_note)
             event = onebot.private_message_event(self.self_id, cid, self.store.display_name(chat), mid,
-                                                 m["text"], int(m["time"]))
+                                                 m["text"], int(m["time"]), reply_id)
         if not self.cfg["receive_only"]:
             await self.ob.push(event)
+
+    def remember_quote(self, chat: str, quote: dict) -> int:
+        """把被引用的那条做成一条消息记下来（最多 200 条），返回它的消息 ID；
+        原作者是小号时 user_id 用小号自己的 ID，AstrBot 才知道引用的是它"""
+        rid = onebot.stable_id(f"{chat}:quote:{quote['svrid'] or quote['text']}")
+        author = quote["sender"] or chat
+        if author == self.store.self_wxid:
+            uid, name = self.self_id, self.store.self_name() or quote["name"]
+        else:
+            uid, name = self.state.id_of(author), quote["name"] or self.store.display_name(author)
+        ts = quote["time"] or int(time.time())
+        if chat.endswith("@chatroom"):
+            msg = onebot.group_message_event(self.self_id, self.state.id_of(chat), uid, name, rid,
+                                             quote["text"], False, ts)
+        else:
+            msg = onebot.private_message_event(self.self_id, uid, name, rid, quote["text"], ts)
+        msg.pop("post_type")
+        self.quoted[rid] = msg
+        self.quoted.move_to_end(rid)
+        while len(self.quoted) > 200:
+            self.quoted.popitem(last=False)
+        return rid
 
     # ---------- 回 ----------
 
@@ -329,6 +357,9 @@ class Connector:
             wxid = self.state.ids.get(str(params.get("user_id")))
             nick = self.store.display_name(wxid) if wxid else str(params.get("user_id"))
             return "ok", 0, {"user_id": params.get("user_id"), "nickname": nick, "sex": "unknown", "age": 0}
+        if action == "get_msg":
+            msg = self.quoted.get(int(params.get("message_id") or 0))
+            return ("ok", 0, msg) if msg else ("failed", 1404, {"message": "只能取到别人引用过的消息"})
         if action == "get_status":
             return "ok", 0, {"online": True, "good": True}
         if action == "get_version_info":

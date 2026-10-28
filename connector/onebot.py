@@ -100,21 +100,32 @@ class OneBotClient:
             await asyncio.sleep(5)
 
 
-def private_message_event(self_id: int, user_id: int, nickname: str, message_id: int, text: str, ts: int) -> dict:
+def _reply_seg(reply_id: int | None) -> tuple[list[dict], str]:
+    """引用回复：最前面放一个 reply 段，AstrBot 会用 get_msg 回来取被引用的那条"""
+    if not reply_id:
+        return [], ""
+    return [{"type": "reply", "data": {"id": str(reply_id)}}], f"[CQ:reply,id={reply_id}]"
+
+
+def private_message_event(self_id: int, user_id: int, nickname: str, message_id: int, text: str, ts: int,
+                          reply_id: int | None = None) -> dict:
+    reply, raw = _reply_seg(reply_id)
     return {
         "time": ts, "self_id": self_id, "post_type": "message", "message_type": "private", "sub_type": "friend",
         "message_id": message_id, "user_id": user_id, "font": 0,
-        "message": [{"type": "text", "data": {"text": text}}], "raw_message": text, "message_format": "array",
+        "message": reply + [{"type": "text", "data": {"text": text}}], "raw_message": raw + text,
+        "message_format": "array",
         "sender": {"user_id": user_id, "nickname": nickname, "sex": "unknown", "age": 0},
     }
 
 
 def group_message_event(self_id: int, group_id: int, user_id: int, nickname: str, message_id: int,
-                        text: str, at_self: bool, ts: int) -> dict:
+                        text: str, at_self: bool, ts: int, reply_id: int | None = None) -> dict:
     """at_self：微信里有人 @ 了小号，就在前面放一个 at 段，AstrBot 按「被 @」处理"""
-    message = ([{"type": "at", "data": {"qq": str(self_id)}}] if at_self else []) + \
+    reply, raw = _reply_seg(reply_id)
+    message = reply + ([{"type": "at", "data": {"qq": str(self_id)}}] if at_self else []) + \
         ([{"type": "text", "data": {"text": text}}] if text else [])  # 只 @ 不说话时正文为空
-    raw = (f"[CQ:at,qq={self_id}] " if at_self else "") + text
+    raw += (f"[CQ:at,qq={self_id}] " if at_self else "") + text
     return {
         "time": ts, "self_id": self_id, "post_type": "message", "message_type": "group", "sub_type": "normal",
         "message_id": message_id, "group_id": group_id, "user_id": user_id, "font": 0, "anonymous": None,

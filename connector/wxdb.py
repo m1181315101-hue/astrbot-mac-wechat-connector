@@ -17,6 +17,7 @@ import re
 import sqlite3
 import struct
 import threading
+import xml.etree.ElementTree as ET
 
 PAGE = 4096
 KEY_SZ = 32
@@ -254,6 +255,39 @@ class PlainDB:
 # ---------- 账号：消息和联系人 ----------
 
 GROUP_PREFIX = re.compile(r"^[A-Za-z0-9_\-@.]+:\n")
+QUOTE_PLACEHOLDER = {3: "[图片]", 34: "[语音]", 43: "[视频]", 47: "[表情]", 48: "[位置]", 42: "[名片]"}
+
+
+def parse_quote(xml_text: str) -> dict | None:
+    """引用回复（local_type 49，子类型 57）：appmsg/title 是新说的话，appmsg/refermsg 是被引用的那条。
+    群里 refermsg 的 chatusr 是原作者、fromusr 是群；chatusr 为空时原作者看 fromusr。
+    被引用的是文字就带原文，图片、表情这类换成占位，链接、文件和引用取标题。解析不了返回 None"""
+    try:
+        appmsg = ET.fromstring(xml_text.strip()).find("appmsg")
+    except ET.ParseError:
+        return None
+    if appmsg is None or (appmsg.findtext("type") or "").strip() != "57":
+        return None
+    ref = appmsg.find("refermsg")
+    if ref is None:
+        return None
+    rtype = int((ref.findtext("type") or "0").strip() or 0)
+    content = ref.findtext("content") or ""
+    if rtype == 1:
+        quoted = content
+    elif rtype == 49:
+        try:
+            quoted = ET.fromstring(GROUP_PREFIX.sub("", content, count=1).strip()).findtext("appmsg/title") or "[链接]"
+        except ET.ParseError:
+            quoted = "[链接]"
+    else:
+        quoted = QUOTE_PLACEHOLDER.get(rtype, "[消息]")
+    return {"title": appmsg.findtext("title") or "",
+            "sender": (ref.findtext("chatusr") or ref.findtext("fromusr") or "").strip(),
+            "name": ref.findtext("displayname") or "", "svrid": (ref.findtext("svrid") or "").strip(),
+            "time": int((ref.findtext("createtime") or "0").strip() or 0), "text": quoted}
+
+
 SYSTEM_IDS = {"filehelper", "weixin", "fmessage", "medianote", "floatbottle", "newsapp",
               "notifymessage", "brandsessionholder", "qqmail", "tmessage", "qmessage"}
 
@@ -340,6 +374,7 @@ class WeChatStore:
 
     def new_messages(self, wxid: str, marks: dict[str, int]) -> list[dict]:
         """marks：{库文件名: 已处理到的 local_id}，原地更新；返回对方发来的新消息（含非文字，type 区分）。
+        引用回复当成文字（type 1，text 是新说的话），另带 quote：被引用的那条（见 parse_quote）。
         调用方启动时先用 latest_ids 把已有会话的水位设到最新（不回放历史）；
         之后才出现的会话表（第一次聊天、新分库）不在 marks 里，从头读。"""
         table, out = self.table_of(wxid), []
@@ -355,12 +390,19 @@ class WeChatStore:
                 marks[name] = local_id
                 if sender == me:
                     continue
-                base_type = local_type & 0xFFFFFFFF  # 高 32 位是子类型（链接、文件等）
-                text = decode_content(content) if base_type == 1 else ""
-                if wxid.endswith("@chatroom"):  # 群里别人发的文字带「发送者wxid:换行」前缀
+                base_type, sub_type = local_type & 0xFFFFFFFF, local_type >> 32  # 高 32 位是子类型（链接、文件等）
+                is_quote = base_type == 49 and sub_type == 57
+                text, quote = (decode_content(content) if base_type == 1 or is_quote else ""), None
+                if wxid.endswith("@chatroom"):  # 群里别人发的文字、引用带「发送者wxid:换行」前缀
                     text = GROUP_PREFIX.sub("", text, count=1)
+                if is_quote:
+                    quote = parse_quote(text)
+                    if quote is None:
+                        text = ""
+                    else:
+                        base_type, text = 1, quote.pop("title")
                 out.append({"local_id": local_id, "server_id": server_id, "type": base_type, "time": create_time,
-                            "sender": names.get(sender, ""), "text": text})
+                            "sender": names.get(sender, ""), "text": text, "quote": quote})
         return out
 
     def self_count(self, wxid: str, since: int, types: tuple[int, ...]) -> int:
