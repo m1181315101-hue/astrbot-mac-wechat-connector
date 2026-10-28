@@ -1,15 +1,16 @@
 #!/usr/bin/env python3
-"""微信 ↔ AstrBot 连接器（OneBot v11）· 第一阶段：文字
+"""微信 ↔ AstrBot 连接器（OneBot v11）
 
 收：轮询本地数据库（wxdb），白名单里的人（私聊）和白名单里的群发来的新文字 → OneBot 消息事件 → AstrBot
     群里有人 @ 小号时，事件前面加一个 at 段，AstrBot 按「被 @」处理
 回：AstrBot 的 send_private_msg / send_group_msg → 发送队列 → 界面驱动（wxui）切换会话、核对、粘贴、回车
-    → 回查数据库确认
+    → 回查数据库确认。文字、图片（GIF 是动画表情）、语音（mp3 文件）按原顺序一段一段发
 
 用法（在微信容器里，用和微信相同的用户运行）：
   python3 bridge.py run    [--config /config/wechat-connector/config.json]
   python3 bridge.py check  [--config ...]            检查密钥、数据库、界面驱动是否就绪
   python3 bridge.py lookup <备注名或昵称> [--config ...]  按名字查 wxid（配置白名单用）
+  python3 bridge.py test-media [--config ...]         给「文件传输助手」发一组文字、图片、动图、语音，自测发送
 """
 import argparse
 import asyncio
@@ -26,10 +27,11 @@ import time
 from collections import deque
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+import media  # noqa: E402
 import onebot  # noqa: E402
 import wxdb  # noqa: E402
 
-VERSION = "0.1.0"
+VERSION = "0.2.0"
 HERE = os.path.dirname(os.path.abspath(__file__))
 log = logging.getLogger("wechat-connector")
 
@@ -48,6 +50,8 @@ DEFAULTS = {
     "typing_delay": {"base": 0.5, "per_char": 0.05, "max": 3.0},
     "ui_python": "/usr/bin/python3",
     "face_map": "",
+    "media_dir": "/tmp/wechat-connector-media",
+    "group_voice_min_seconds": 20,
 }
 
 
@@ -152,30 +156,41 @@ class UiDriver:
             return json.loads(line)
 
 
-def segments_to_text(message, face_names: dict[str, str], at_name=lambda qq: "") -> tuple[str, list[str]]:
-    """OneBot 消息 → 纯文字；返回 (文字, 丢掉的段类型)。
-    QQ 表情编号翻回 [名字]，微信自己认这种写法；at 段写成「@名字 」文字（只是显示，不会真的提醒对方）"""
-    dropped = []
+def message_parts(message, face_names: dict[str, str], at_name=lambda qq: "") -> tuple[list[tuple[str, str]], list[str]]:
+    """OneBot 消息 → 按顺序的 [(text, 文字) / (image, file) / (record, file)]，相邻的文字合成一段；
+    另外返回丢掉的段类型。QQ 表情编号翻回 [名字]，微信自己认这种写法；
+    at 段写成「@名字 」文字（只是显示，不会真的提醒对方）"""
     if isinstance(message, str):
         text = re.sub(r"\[CQ:[^\]]*\]", "", message)
         text = text.replace("&#91;", "[").replace("&#93;", "]").replace("&#44;", ",").replace("&amp;", "&")
-        return text, dropped
-    parts = []
+        return ([("text", text.strip())] if text.strip() else []), []
+    parts: list[tuple[str, str]] = []
+    dropped = []
+
+    def add_text(t: str) -> None:
+        if parts and parts[-1][0] == "text":
+            parts[-1] = ("text", parts[-1][1] + t)
+        else:
+            parts.append(("text", t))
+
     for seg in message or []:
         if not isinstance(seg, dict):
             continue
         kind, data = seg.get("type"), seg.get("data") or {}
         if kind == "text":
-            parts.append(str(data.get("text", "")))
+            add_text(str(data.get("text", "")))
         elif kind == "face" and str(data.get("id")) in face_names:
-            parts.append(f"[{face_names[str(data.get('id'))]}]")
+            add_text(f"[{face_names[str(data.get('id'))]}]")
         elif kind == "at":
             name = at_name(str(data.get("qq", "")))
             if name:
-                parts.append(f"@{name} ")
+                add_text(f"@{name} ")
+        elif kind in ("image", "record") and data.get("file"):
+            parts.append((kind, str(data["file"])))
         elif kind != "reply":
             dropped.append(str(kind))
-    return "".join(parts), dropped
+    parts = [(k, v.strip() if k == "text" else v) for k, v in parts]
+    return [(k, v) for k, v in parts if v], dropped
 
 
 class Connector:
@@ -193,6 +208,7 @@ class Connector:
         self.send_lock = asyncio.Lock()
         self.sent_times: deque[float] = deque()
         self.at_pattern = None  # init_marks 里按小号昵称生成
+        self.media = media.MediaDir(cfg["media_dir"])
         self.face_names = {}
         if cfg.get("face_map"):
             with open(cfg["face_map"], encoding="utf-8") as f:
@@ -308,7 +324,7 @@ class Connector:
         if action == "get_version_info":
             return "ok", 0, {"app_name": "wechat-connector", "app_version": VERSION, "protocol_version": "v11"}
         if action in ("can_send_image", "can_send_record"):
-            return "ok", 0, {"yes": False}
+            return "ok", 0, {"yes": True}
         return "failed", 1404, {"message": f"微信连接器不支持 {action}"}
 
     async def _rate_limit(self) -> None:
@@ -332,40 +348,91 @@ class Connector:
         if not wxid or wxid not in allowed:
             log.warning("拒绝发送：%s 不在%s白名单", target_id, "群" if group else "")
             return "failed", 1403, {"message": "目标不在白名单"}
-        uid = target_id
-        text, dropped = segments_to_text(params.get("message"), self.face_names, self._at_name)
-        text = text.strip()
+        parts, dropped = message_parts(params.get("message"), self.face_names, self._at_name)
         if dropped:
-            log.info("丢掉不支持的消息段 %s（第一阶段只发文字）", dropped)
-        if not text:
-            return "failed", 1400, {"message": "第一阶段只支持文字"}
+            log.info("丢掉不支持的消息段 %s", dropped)
+        if not parts:
+            return "failed", 1400, {"message": "没有能发的内容（只支持文字、图片、语音）"}
         if os.path.exists(os.path.join(self.state_dir, "STOP")):
             log.warning("有 STOP 文件，暂停发送")
             return "failed", 1503, {"message": "连接器已暂停发送"}
-        async with self.send_lock:  # 界面只有一个：一条一条来
-            await self._rate_limit()
-            td = self.cfg["typing_delay"]
-            delay = min(td["max"], td["base"] + td["per_char"] * len(text))
-            since = int(time.time()) - 2
-            req = {"op": "send", "name": self.store.display_name(wxid), "text": text,
-                   "sections": ["群聊"] if group else ["联系人"],
-                   "use_list": self.store.name_is_unique(wxid), "delay": delay}
-            resp = await asyncio.to_thread(self.ui.request, req)
-            if not resp.get("ok"):
-                log.warning("发给 %s 失败：%s", uid, resp.get("reason"))
-                return "failed", 1500, {"message": f"发送失败：{resp.get('reason')}"}
-            confirmed = await self._confirm(wxid, since, text)
-            log.info("发给 %s %d 字，路径 %s，数据库确认%s", uid, len(text), resp.get("path"),
-                     "通过" if confirmed else "超时（界面显示已发出）")
-        return "ok", 0, {"message_id": onebot.stable_id(f"out:{time.time_ns()}")}
+        name = self.store.display_name(wxid)
+        sections = ["群聊"] if group else ["联系人"]
+        return await self.send_parts(target_id, wxid, name, sections, parts, group)
 
-    async def _confirm(self, wxid: str, since: int, text: str, seconds: float = 8.0) -> bool:
+    async def send_parts(self, label: str, wxid: str, name: str, sections: list[str], parts, group: bool):
+        """一段一段发；有一段发出去就算成功，全都没发出去才回失败（带上原因，插件好改用文字）"""
+        sent, reasons = 0, []
+        use_list = self.store.name_is_unique(wxid) if wxid != "filehelper" else True
+        async with self.send_lock:  # 界面只有一个：一条一条来
+            for kind, value in parts:
+                if kind == "text":
+                    ok, why = await self._send_one(label, wxid, name, sections, use_list, text=value)
+                else:
+                    path, why = await asyncio.to_thread(self._prepare_media, kind, value, group)
+                    ok = False
+                    if path:
+                        ok, why = await self._send_one(label, wxid, name, sections, use_list, file=path,
+                                                       types=(3, 47) if kind == "image" else (49, 34))
+                if ok:
+                    sent += 1
+                else:
+                    reasons.append(why)
+        if sent:
+            return "ok", 0, {"message_id": onebot.stable_id(f"out:{time.time_ns()}")}
+        return "failed", 1500, {"message": "；".join(reasons) or "发送失败"}
+
+    def _prepare_media(self, kind: str, value: str, group: bool) -> tuple[str | None, str]:
+        try:
+            data = media.load_data(value)
+        except Exception as e:
+            return None, f"取不到{'图片' if kind == 'image' else '语音'}数据（{type(e).__name__}）"
+        if not data:
+            return None, "取不到媒体数据（可能是只在 AstrBot 容器里的文件路径）"
+        if kind == "image":
+            path = self.media.image_file(data)
+            return (path, "") if path else (None, "不认识的图片格式")
+        seconds = media.audio_seconds(data)
+        min_seconds = self.cfg["group_voice_min_seconds"]
+        if group and (min_seconds < 0 or seconds < min_seconds):
+            log.info("群里不发 %.0f 秒的短语音（group_voice_min_seconds=%s）", seconds, min_seconds)
+            return None, "群里不发短语音，请改用文字回复"
+        path = self.media.voice_file(data, "翻唱.mp3" if seconds >= 20 else "语音.mp3")
+        return (path, "") if path else (None, "不认识的音频格式")
+
+    async def _send_one(self, label: str, wxid: str, name: str, sections: list[str], use_list: bool,
+                        text: str = "", file: str = "", types: tuple[int, ...] = ()) -> tuple[bool, str]:
+        await self._rate_limit()
+        since = int(time.time()) - 2
+        if text:
+            td = self.cfg["typing_delay"]
+            req = {"op": "send", "name": name, "text": text, "sections": sections, "use_list": use_list,
+                   "delay": min(td["max"], td["base"] + td["per_char"] * len(text))}
+        else:
+            async with self.db_lock:
+                await asyncio.to_thread(self.store.refresh)
+                before = await asyncio.to_thread(self.store.self_count, wxid, since, types)
+            req = {"op": "send", "name": name, "file": file, "sections": sections, "use_list": use_list, "delay": 0.3}
+        resp = await asyncio.to_thread(self.ui.request, req)
+        what = f"{len(text)} 字" if text else os.path.basename(file)
+        if not resp.get("ok"):
+            log.warning("发给 %s 失败（%s）：%s", label, what, resp.get("reason"))
+            return False, f"发送失败：{resp.get('reason')}"
+        if text:
+            confirmed = await self._confirm(lambda: self.store.sent_since(wxid, since, text))
+        else:
+            confirmed = await self._confirm(lambda: self.store.self_count(wxid, since, types) > before, 15.0)
+        log.info("发给 %s %s，路径 %s，数据库确认%s", label, what, resp.get("path"),
+                 "通过" if confirmed else "超时（界面显示已发出）")
+        return True, ""
+
+    async def _confirm(self, check, seconds: float = 8.0) -> bool:
         deadline = time.time() + seconds
         while time.time() < deadline:
             await asyncio.sleep(0.5)
             async with self.db_lock:
                 await asyncio.to_thread(self.store.refresh)
-                if await asyncio.to_thread(self.store.sent_since, wxid, since, text):
+                if await asyncio.to_thread(check):
                     return True
         return False
 
@@ -408,9 +475,52 @@ def cmd_lookup(cfg: dict, name: str) -> int:
     return 0 if hits else 1
 
 
+def cmd_test_media(cfg: dict) -> int:
+    """不经过 AstrBot，直接把一组文字、图片、动图、语音发给「文件传输助手」，走和正式发送一样的路径"""
+    import base64
+    import io
+    import math
+    import struct
+    import wave
+    from PIL import Image, ImageDraw
+
+    def b64(data: bytes) -> str:
+        return "base64://" + base64.b64encode(data).decode()
+
+    png = io.BytesIO()
+    im = Image.new("RGB", (240, 160), (90, 160, 230))
+    ImageDraw.Draw(im).ellipse((80, 40, 160, 120), fill=(255, 220, 80))
+    im.save(png, "PNG")
+    frames = []
+    for i in range(4):
+        f = Image.new("RGB", (160, 160), (255, 230, 120))
+        ImageDraw.Draw(f).ellipse((20 + i * 20, 50, 80 + i * 20, 110), fill=(80, 140, 230))
+        frames.append(f)
+    gif = io.BytesIO()
+    frames[0].save(gif, "GIF", save_all=True, append_images=frames[1:], duration=200, loop=0)
+    wav = io.BytesIO()
+    with wave.open(wav, "wb") as w:
+        w.setnchannels(1)
+        w.setsampwidth(2)
+        w.setframerate(16000)
+        w.writeframes(b"".join(struct.pack("<h", int(6000 * math.sin(2 * math.pi * 523 * i / 16000)))
+                               for i in range(32000)))
+    parts = [("text", f"微信连接器 {VERSION} 自测：下面是一张图、一个动图、一段 2 秒的提示音"),
+             ("image", b64(png.getvalue())), ("image", b64(gif.getvalue())), ("record", b64(wav.getvalue()))]
+
+    async def go():
+        c = Connector(cfg)
+        await c._refresh()
+        return await c.send_parts("文件传输助手", "filehelper", "文件传输助手", ["功能"], parts, group=False)
+
+    status, _code, data = asyncio.run(go())
+    print("结果：", status, data)
+    return 0 if status == "ok" else 1
+
+
 def main() -> None:
     ap = argparse.ArgumentParser()
-    ap.add_argument("cmd", choices=["run", "check", "lookup"])
+    ap.add_argument("cmd", choices=["run", "check", "lookup", "test-media"])
     ap.add_argument("name", nargs="?")
     ap.add_argument("--config", default="/config/wechat-connector/config.json")
     args = ap.parse_args()
@@ -420,6 +530,8 @@ def main() -> None:
     if args.cmd == "lookup":
         sys.exit(cmd_lookup(cfg, args.name or ""))
     setup_logging(cfg["state_dir"])
+    if args.cmd == "test-media":
+        sys.exit(cmd_test_media(cfg))
     asyncio.run(Connector(cfg).run())
 
 

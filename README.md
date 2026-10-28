@@ -7,7 +7,10 @@
 - **收**：读微信自己写在本地的聊天数据库。
 - **发**：用无障碍接口和模拟键盘，像人一样在微信界面里操作。
 
-> **当前是第一阶段，只支持文字。** 私聊只放行白名单里的人；群聊只放行白名单里的群，群里有人 @ 小号时才会触发回复。图片、语音、表情包会在之后的版本加上。
+> **当前能做的**：
+> - **收**：只收文字。私聊只放行白名单里的人；群聊只放行白名单里的群，群里有人 @ 小号时才会触发回复。
+> - **发**：文字、图片、表情包（GIF 会变成微信的动画表情）、语音（以 mp3 音频文件发出）。AstrBot 的插件和 MCP 工具都照常可用，它们发出的图片、语音会被原样转发。
+> - 还不能收别人发的图片和语音，正在做。
 
 ## ⚠️ 先看风险
 
@@ -27,7 +30,7 @@
 │     ├─ 收：每秒看一眼消息库 → 解密新写入的部分（明文只在内存里）               │
 │     │       → 白名单里的新文字 → OneBot 消息事件                             │
 │     ├─ OneBot v11 反向 WS 客户端 ──────────────→ ws://astrbot:6200/ws        │
-│     └─ 回：send_private_msg / send_group_msg → 发送队列                       │
+│     └─ 回：send_private_msg / send_group_msg → 发送队列（文字、图片、语音按顺序）│
 │            → wxui.py：按名字切换会话 → 核对 → 粘贴 → 回车 → 回查数据库确认   │
 └─────────────────────────────────────────────────────────────────────────────┘
 ```
@@ -38,6 +41,7 @@
 | `connector/wxdb.py` | 解密数据库（SQLCipher 4）：主库加 WAL 增量叠加，用 `sqlite3.deserialize` 在内存里打开，读新消息和通讯录 |
 | `connector/wxui.py` | 界面驱动：通过无障碍接口（AT-SPI）读微信界面，按名字找会话，用 xdotool 点击和粘贴 |
 | `connector/onebot.py` | OneBot v11 反向 WebSocket 客户端，以及消息事件的格式 |
+| `connector/media.py` | 把 AstrBot 发来的图片、语音（base64）落成临时文件：WEBP 转 PNG，wav 用 lame 转 mp3，估算音频时长 |
 | `connector/bridge.py` | 主程序：轮询、白名单、发送队列、限速、确认 |
 
 ## 环境要求
@@ -84,7 +88,7 @@ docker network connect <AstrBot 所在的网络> wechat
 ### 2. 在容器里装工具
 
 ```bash
-docker exec -u 0 wechat sh -c 'apt-get update && apt-get install -y --no-install-recommends gdb xdotool xclip at-spi2-core gir1.2-atspi-2.0'
+docker exec -u 0 wechat sh -c 'apt-get update && apt-get install -y --no-install-recommends gdb xdotool xclip at-spi2-core gir1.2-atspi-2.0 lame'
 docker cp connector wechat:/config/wechat-connector/connector
 docker exec -u 0 wechat chown -R abc:users /config/wechat-connector
 ```
@@ -129,6 +133,8 @@ docker exec -u abc wechat /lsiopy/bin/python3 /config/wechat-connector/connector
 | `face_map` | 可选，指向 QQ 表情插件的 `face_map.json`。AstrBot 回复里的 QQ 表情会翻回 `[旺柴]` 这种文字，微信会显示成表情 |
 | `max_sends_per_minute` | 每分钟最多发几条，默认 20，多出来的排队 |
 | `max_message_age` | 超过这么多秒的旧消息不转发，默认 600。连接器停了一段时间再启动时，不会回一堆过期消息 |
+| `group_voice_min_seconds` | 群里只发不短于这么多秒的语音，默认 20：点歌（翻唱）会发，随口的短语音不发，免得群里全是音频文件。设成 0 群里所有语音都发，设成 -1 群里一律不发。私聊不受影响。不发时会告诉 AstrBot「发送失败」，插件会改用文字回复 |
+| `media_dir` | 待发图片、语音的临时目录，默认 `/tmp/wechat-connector-media`，超过 10 分钟的自动清掉 |
 
 ### 5. AstrBot 里加一个平台
 
@@ -147,6 +153,9 @@ docker exec -u abc wechat /lsiopy/bin/python3 /config/wechat-connector/connector
 ```bash
 # 检查：密钥、数据库、通讯录、界面驱动是不是都就绪
 docker exec -u abc wechat /lsiopy/bin/python3 /config/wechat-connector/connector/bridge.py check
+
+# 自测发送：给「文件传输助手」发一段文字、一张图、一个动图、一段语音（不经过 AstrBot）
+docker exec -u abc wechat /lsiopy/bin/python3 /config/wechat-connector/connector/bridge.py test-media
 
 # 后台运行
 docker exec -d -u abc wechat sh -c 'cd /config/wechat-connector && exec /lsiopy/bin/python3 -u connector/bridge.py run >> stdout.log 2>&1'
@@ -169,7 +178,9 @@ docker exec -d -u abc wechat sh -c 'cd /config/wechat-connector && exec /lsiopy/
 
 ## 已知限制
 
-- **第一阶段只有文字**：收到的图片、语音、表情包都会被跳过；AstrBot 回复里的图片、语音也发不出去。语音本来就做不到「按住说话」那种语音条，以后最多以文件形式发。
+- **收**：只收文字。别人发的图片、语音、表情包会被跳过（日志里记一行类型）。
+- **语音是音频文件**：电脑版微信本来就发不了「按住说话」的语音条，所以语音以 mp3 文件发出，对方点开播放。
+- **视频、文件**：AstrBot 发视频、文件时给的是它自己容器里的路径，连接器拿不到，会跳过。
 - **回复会慢几秒**：会话已经开着时大约 1 秒；要切换会话时 2～6 秒，再加上打字停顿。
 - **同名的联系人或群会被跳过**：给它们设不同的备注名就行。
 - **@ 只是文字**：回复里的 @ 是「@名字」这样的文字，对方不会收到提醒。

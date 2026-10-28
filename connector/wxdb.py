@@ -350,6 +350,19 @@ class WeChatStore:
                             "sender": names.get(sender, ""), "text": text})
         return out
 
+    def self_count(self, wxid: str, since: int, types: tuple[int, ...]) -> int:
+        """这个会话里 since 之后自己发出的、类型在 types 里的消息有几条（发图片、文件后用来确认）"""
+        table, n = self.table_of(wxid), 0
+        for db in self.msg_dbs.values():
+            con = db.con
+            if con is None or not con.execute("select 1 from sqlite_master where name = ?", (table,)).fetchone():
+                continue
+            me = self._self_rowid(con)
+            for (lt,) in con.execute(f"select local_type from {table} where create_time >= ? and real_sender_id = ?",
+                                     (since, me)):
+                n += (lt & 0xFFFFFFFF) in types
+        return n
+
     def sent_since(self, wxid: str, since: int, text: str) -> bool:
         """发送后确认：这个会话里 since 之后有没有一条自己发出的、内容相同的文字"""
         table = self.table_of(wxid)

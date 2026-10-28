@@ -7,7 +7,10 @@ Linux 微信是 Qt 写的，带无障碍桥：打开 org.a11y.Status.IsEnabled �
 
   {"op": "ping"}
   {"op": "send", "name": "备注名", "text": "...", "sections": ["联系人"], "use_list": true, "delay": 1.2}
+  {"op": "send", "name": "备注名", "file": "/tmp/xx/语音.mp3", "sections": ["群聊"], "use_list": true}
   → {"ok": true, "path": "list|search|already"} / {"ok": false, "reason": "..."}
+
+发文件是用 text/uri-list 粘贴：GIF 会变成动画表情，PNG/JPG 变成图片，其他（比如 mp3）变成文件。
 
 安全规则：
 - 会话列表只在 use_list=true（调用方确认这个名字在通讯录里独一无二）时用，按第一行精确匹配；
@@ -16,9 +19,11 @@ Linux 微信是 Qt 写的，带无障碍桥：打开 org.a11y.Status.IsEnabled �
 不往标准输出写任何聊天内容；日志只写到标准错误，而且只有名字长度、坐标和结果。
 """
 import json
+import os
 import subprocess
 import sys
 import time
+import urllib.parse
 
 import gi
 
@@ -37,10 +42,10 @@ def sh(*args: str) -> str:
     return subprocess.run(args, capture_output=True, check=False).stdout.decode().strip()
 
 
-def set_clipboard(data: bytes) -> None:
+def set_clipboard(data: bytes, mime: str | None = None) -> None:
     # xclip 会留在后台占着剪贴板，输出不能接管道，否则会一直等它退出
-    subprocess.run(["xclip", "-selection", "clipboard"], input=data,
-                   stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, check=False)
+    cmd = ["xclip", "-selection", "clipboard"] + (["-t", mime] if mime else [])
+    subprocess.run(cmd, input=data, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, check=False)
 
 
 def enable_a11y() -> bool:
@@ -223,29 +228,34 @@ def open_chat(target: str, sections: set[str], use_list: bool) -> tuple[bool, st
 
 def handle_send(req: dict) -> dict:
     target = req["name"]
-    text = req.get("text", "")
-    if not target or not text:
+    text, path = req.get("text", ""), req.get("file", "")
+    if not target or not (text or path):
         return {"ok": False, "reason": "名字或内容为空"}
+    if path and not os.path.isfile(path):
+        return {"ok": False, "reason": "要发的文件不存在"}
     if main_frame() is None:
         return {"ok": False, "reason": "无障碍树里没有微信主窗口"}
     wid = sh("xdotool", "search", "--onlyvisible", "--name", "^微信$").split()
     if wid:
         sh("xdotool", "windowactivate", "--sync", wid[0])
-    ok, path = open_chat(target, set(req.get("sections") or ["联系人"]), bool(req.get("use_list")))
+    ok, how = open_chat(target, set(req.get("sections") or ["联系人"]), bool(req.get("use_list")))
     if not ok:
-        return {"ok": False, "reason": path}
+        return {"ok": False, "reason": how}
     time.sleep(max(0.0, float(req.get("delay", 0))))  # 像人在打字
-    set_clipboard(text.encode())
+    if path:
+        set_clipboard(f"file://{urllib.parse.quote(path)}\r\n".encode(), "text/uri-list")
+    else:
+        set_clipboard(text.encode())
     if current_chat() != target:  # 等待期间有弹窗或有人动了界面
         return {"ok": False, "reason": "粘贴前核对失败"}
     sh("xdotool", "key", "--clearmodifiers", "ctrl+v")
-    time.sleep(0.3)
+    time.sleep(1.0 if path else 0.3)  # 文件要等微信把附件放进输入框
     if current_chat() != target:
         sh("xdotool", "key", "--clearmodifiers", "ctrl+a", "Delete")
         return {"ok": False, "reason": "回车前核对失败，已清空输入框"}
     sh("xdotool", "key", "--clearmodifiers", "Return")
-    log(f"已发送：名字 {len(target)} 字，内容 {len(text)} 字，路径 {path}")
-    return {"ok": True, "path": path}
+    log(f"已发送：名字 {len(target)} 字，{'文件' if path else f'文字 {len(text)} 字'}，路径 {how}")
+    return {"ok": True, "path": how}
 
 
 def main() -> None:
