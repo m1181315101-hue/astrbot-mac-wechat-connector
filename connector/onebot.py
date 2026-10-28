@@ -115,28 +115,54 @@ def _image_seg(image: dict | None) -> tuple[list[dict], str]:
     return [{"type": "image", "data": {"file": image["file"], "url": image["url"]}}], "[图片]"
 
 
+def _forward_seg(forward: dict | None) -> tuple[list[dict], str]:
+    """收到的聊天记录：一段文字「[聊天记录] 标题」加一个 forward 段（和 NapCat 一样只带 id），内容用 get_forward_msg 取。
+    要带那段文字：消息里只有 forward 段时 AstrBot 当成空消息，不交给模型"""
+    if not forward:
+        return [], ""
+    label = f"[聊天记录] {forward['title']}"
+    return ([{"type": "text", "data": {"text": label}}, {"type": "forward", "data": {"id": forward["id"]}}],
+            f"{label}[CQ:forward,id={forward['id']}]")
+
+
+def forward_nodes(self_id: int, items: list[dict], message_type: str) -> dict:
+    """get_forward_msg 的返回，和 NapCat 一样是 {"messages": [节点]}，每个节点像一条消息（sender、time、message 段）。
+    items 是聊天记录里的每一条（name、time、text）；只有昵称，所以 sender 不带 user_id"""
+    nodes = []
+    for i, item in enumerate(items):
+        text = item["text"] or "[消息]"
+        nodes.append({"self_id": self_id, "time": item["time"], "message_type": message_type,
+                      "message_id": i + 1, "sender": {"nickname": item["name"], "card": item["name"]},
+                      "message": [{"type": "text", "data": {"text": text}}], "raw_message": text,
+                      "message_format": "array", "post_type": "message"})
+    return {"messages": nodes}
+
+
 def private_message_event(self_id: int, user_id: int, nickname: str, message_id: int, text: str, ts: int,
-                          reply_id: int | None = None, image: dict | None = None) -> dict:
+                          reply_id: int | None = None, image: dict | None = None,
+                          forward: dict | None = None) -> dict:
     reply, raw = _reply_seg(reply_id)
     img, img_raw = _image_seg(image)
+    fwd, fwd_raw = _forward_seg(forward)
     return {
         "time": ts, "self_id": self_id, "post_type": "message", "message_type": "private", "sub_type": "friend",
         "message_id": message_id, "user_id": user_id, "font": 0,
-        "message": reply + img + ([{"type": "text", "data": {"text": text}}] if text else []),
-        "raw_message": raw + img_raw + text, "message_format": "array",
+        "message": reply + img + fwd + ([{"type": "text", "data": {"text": text}}] if text else []),
+        "raw_message": raw + img_raw + fwd_raw + text, "message_format": "array",
         "sender": {"user_id": user_id, "nickname": nickname, "sex": "unknown", "age": 0},
     }
 
 
 def group_message_event(self_id: int, group_id: int, user_id: int, nickname: str, message_id: int,
                         text: str, at_self: bool, ts: int, reply_id: int | None = None,
-                        image: dict | None = None) -> dict:
+                        image: dict | None = None, forward: dict | None = None) -> dict:
     """at_self：微信里有人 @ 了小号，就在前面放一个 at 段，AstrBot 按「被 @」处理"""
     reply, raw = _reply_seg(reply_id)
     img, img_raw = _image_seg(image)
-    message = reply + ([{"type": "at", "data": {"qq": str(self_id)}}] if at_self else []) + img + \
+    fwd, fwd_raw = _forward_seg(forward)
+    message = reply + ([{"type": "at", "data": {"qq": str(self_id)}}] if at_self else []) + img + fwd + \
         ([{"type": "text", "data": {"text": text}}] if text else [])  # 只 @ 不说话时正文为空
-    raw += (f"[CQ:at,qq={self_id}] " if at_self else "") + img_raw + text
+    raw += (f"[CQ:at,qq={self_id}] " if at_self else "") + img_raw + fwd_raw + text
     return {
         "time": ts, "self_id": self_id, "post_type": "message", "message_type": "group", "sub_type": "normal",
         "message_id": message_id, "group_id": group_id, "user_id": user_id, "font": 0, "anonymous": None,

@@ -256,6 +256,9 @@ class PlainDB:
 
 GROUP_PREFIX = re.compile(r"^[A-Za-z0-9_\-@.]+:\n")
 QUOTE_PLACEHOLDER = {3: "[图片]", 34: "[语音]", 43: "[视频]", 47: "[表情]", 48: "[位置]", 42: "[名片]"}
+# 聊天记录里每条的 datatype：1 是文字，17 是嵌套的聊天记录，其余换成占位（链接、文件这类后面跟标题）
+RECORD_PLACEHOLDER = {2: "[图片]", 3: "[语音]", 4: "[视频]", 5: "[链接]", 6: "[位置]", 8: "[文件]",
+                      17: "[聊天记录]", 19: "[小程序]", 22: "[视频号]", 29: "[音乐]", 37: "[表情]"}
 
 
 def parse_quote(xml_text: str) -> dict | None:
@@ -273,19 +276,64 @@ def parse_quote(xml_text: str) -> dict | None:
         return None
     rtype = int((ref.findtext("type") or "0").strip() or 0)
     content = ref.findtext("content") or ""
+    record = None
     if rtype == 1:
         quoted = content
     elif rtype == 49:
+        inner = GROUP_PREFIX.sub("", content, count=1).strip()
         try:
-            quoted = ET.fromstring(GROUP_PREFIX.sub("", content, count=1).strip()).findtext("appmsg/title") or "[链接]"
+            quoted = ET.fromstring(inner).findtext("appmsg/title") or "[链接]"
         except ET.ParseError:
             quoted = "[链接]"
+        record = parse_record(inner)  # 引用的是聊天记录时带上内容
     else:
         quoted = QUOTE_PLACEHOLDER.get(rtype, "[消息]")
     return {"title": appmsg.findtext("title") or "",
             "sender": (ref.findtext("chatusr") or ref.findtext("fromusr") or "").strip(),
             "name": ref.findtext("displayname") or "", "svrid": (ref.findtext("svrid") or "").strip(),
-            "time": int((ref.findtext("createtime") or "0").strip() or 0), "text": quoted}
+            "time": int((ref.findtext("createtime") or "0").strip() or 0), "text": quoted, "record": record}
+
+
+def parse_record(xml_text: str) -> dict | None:
+    """聊天记录（local_type 49，子类型 19）：appmsg/recorditem 里又是一段 XML，datalist 下每个 dataitem 是一条。
+    sourcename 是说话人的昵称（看不出 wxid：hashusername 是加了盐的），srcMsgCreateTime 是原消息时间，
+    文字在 datadesc，链接、文件这类取 datatitle，图片、语音、视频换成占位，嵌套的聊天记录在 recordxml/recordinfo 里。
+    返回 {"title", "items": [{"name", "time", "text", "record"}]}，解析不了返回 None"""
+    try:
+        appmsg = ET.fromstring(xml_text.strip()).find("appmsg")
+        if appmsg is None or (appmsg.findtext("type") or "").strip() != "19":
+            return None
+        info = ET.fromstring((appmsg.findtext("recorditem") or "").strip())
+    except ET.ParseError:
+        return None
+    return _record_info(info, appmsg.findtext("title") or "")
+
+
+def _record_info(info: ET.Element, title: str, depth: int = 0) -> dict:
+    items = []
+    datalist = info.find("datalist")
+    for d in datalist.findall("dataitem") if datalist is not None else []:
+        dtype = int(d.get("datatype")) if (d.get("datatype") or "").isdigit() else 0
+        nested = d.find("recordxml/recordinfo")
+        record = _record_info(nested, d.findtext("datatitle") or "", depth + 1) if nested is not None and depth < 3 else None
+        if dtype == 1:
+            text = (d.findtext("datadesc") or "").strip()
+        else:
+            text = f"{RECORD_PLACEHOLDER.get(dtype, '[消息]')} {(d.findtext('datatitle') or '').strip()}".strip()
+        ts = (d.findtext("srcMsgCreateTime") or "").strip()
+        items.append({"name": (d.findtext("sourcename") or "").strip(), "time": int(ts) if ts.isdigit() else 0,
+                      "text": text, "record": record})
+    return {"title": title.strip() or (info.findtext("title") or "").strip() or "聊天记录", "items": items}
+
+
+def record_text(item: dict, depth: int = 0) -> str:
+    """聊天记录里的一条变成文字；嵌套的聊天记录展开成缩进的「昵称: 内容」"""
+    if not item.get("record"):
+        return item["text"]
+    pad = "  " * (depth + 1)
+    lines = [f"[聊天记录] {item['record']['title']}"]
+    lines += [f"{pad}{sub['name'] or '未知'}: {record_text(sub, depth + 1)}" for sub in item["record"]["items"]]
+    return "\n".join(lines)
 
 
 def parse_sticker(xml_text: str) -> dict | None:
@@ -408,7 +456,9 @@ class WeChatStore:
                     continue
                 base_type, sub_type = local_type & 0xFFFFFFFF, local_type >> 32  # 高 32 位是子类型（链接、文件等）
                 is_quote = base_type == 49 and sub_type == 57
-                text, quote, sticker = (decode_content(content) if base_type in (1, 47) or is_quote else ""), None, None
+                is_record = base_type == 49 and sub_type == 19
+                text, quote, sticker, record = (decode_content(content) if base_type in (1, 47) or is_quote or is_record
+                                                else ""), None, None, None
                 if wxid.endswith("@chatroom"):  # 群里别人发的文字、引用带「发送者wxid:换行」前缀
                     text = GROUP_PREFIX.sub("", text, count=1)
                 if is_quote:
@@ -417,11 +467,23 @@ class WeChatStore:
                         text = ""
                     else:
                         base_type, text = 1, quote.pop("title")
+                        if quote["record"] is not None and not quote["record"]["items"] and quote["svrid"].isdigit():
+                            quote["record"] = self._original_record(con, table, int(quote["svrid"])) or quote["record"]
                 elif base_type == 47:
                     sticker, text = parse_sticker(text), ""
+                elif is_record:
+                    record, text = parse_record(text), ""
                 out.append({"local_id": local_id, "server_id": server_id, "type": base_type, "time": create_time,
-                            "sender": names.get(sender, ""), "text": text, "quote": quote, "sticker": sticker})
+                            "sender": names.get(sender, ""), "text": text, "quote": quote, "sticker": sticker,
+                            "record": record})
         return out
+
+    @staticmethod
+    def _original_record(con, table: str, server_id: int) -> dict | None:
+        """引用聊天记录时 refermsg 里的 recorditem 是截断的（没有各条内容），按 svrid 回会话表里找原消息"""
+        row = con.execute(f"select message_content from {table} where server_id = ? and local_type = ?",
+                          (server_id, 49 | (19 << 32))).fetchone()
+        return parse_record(GROUP_PREFIX.sub("", decode_content(row[0]), count=1)) if row else None
 
     def self_count(self, wxid: str, since: int, types: tuple) -> int:
         """这个会话里 since 之后自己发出的、类型在 types 里的消息有几条（发图片、文件后用来确认）。

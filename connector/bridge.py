@@ -3,6 +3,7 @@
 
 收：轮询本地数据库（wxdb），白名单里的人（私聊；写 "*" 就是所有好友）和白名单里的群发来的新文字 → OneBot 消息事件 → AstrBot
     表情包：按消息里的 cdnurl 下载原图核对（md5、格式、大小），合格的以 image 段（文件名 + 原图地址，和 NapCat 一样）交给 AstrBot
+    聊天记录（别人转发的多条消息）：和 NapCat 的合并转发一样给一个 forward 段，AstrBot 和插件用 get_forward_msg 取各条内容
     群里有人 @ 小号时，事件前面加一个 at 段，AstrBot 按「被 @」处理
     引用回复：事件前面加一个 reply 段，被引用的那条记在内存里，AstrBot 用 get_msg 来取；
     引用的是小号的话，AstrBot 当成在叫它（和 QQ 上回复机器人的消息一样）
@@ -36,7 +37,7 @@ import media  # noqa: E402
 import onebot  # noqa: E402
 import wxdb  # noqa: E402
 
-VERSION = "0.6.1"
+VERSION = "0.7.0"
 HERE = os.path.dirname(os.path.abspath(__file__))
 # 界面驱动的这些失败都发生在回车之前（回车前核对失败时已经清空输入框），一个字都没发出去，可以重试
 # 发图片后回查数据库确认用：PNG/JPG 存成图片 3，GIF 粘贴后存成动画表情附件 (49, 8)，有时是表情 47
@@ -65,6 +66,7 @@ DEFAULTS = {
     "receive_stickers": True,   # 收别人发的表情包，当成图片交给 AstrBot
     "group_stickers": True,     # 群里的表情包也收（陪伴类插件开着群聊看图时，每张会多一次看图调用）
     "max_sticker_kb": 5120,     # 超过这么大的表情包不收
+    "receive_records": True,    # 收别人转发的聊天记录，按合并转发交给 AstrBot（里面的图片、语音换成占位）
     "max_text_chars": 1500,     # 一条文字超过这么多字就按换行拆成几条发
     "max_queue_wait": 150,  # 排队超过这么多秒还没轮到就不发了（AstrBot 等回执最多 180 秒，超时后插件可能已经改发文字）
 }
@@ -270,6 +272,7 @@ class Connector:
         self.at_pattern = None  # init_marks 里按小号昵称生成
         self.quoted: OrderedDict[int, dict] = OrderedDict()  # 被引用的消息，给 get_msg 用
         self.stickers: OrderedDict[str, dict] = OrderedDict()  # md5 → 已核对过的 {file, url}，同一个表情包不重复下载
+        self.records: OrderedDict[str, dict] = OrderedDict()  # 收到的聊天记录，forward id → 内容，给 get_forward_msg 用
         self.media = media.MediaDir(cfg["media_dir"])
         self.face_names = {}
         if cfg.get("face_map"):
@@ -336,7 +339,7 @@ class Connector:
         if age > self.cfg["max_message_age"]:
             log.info("跳过 %s 的旧消息（%d 秒前）", cid, age)
             return
-        image = None
+        image = forward = None
         if m["type"] == 47:
             if not self.cfg["receive_stickers"] or (chat.endswith("@chatroom") and not self.cfg["group_stickers"]):
                 return
@@ -344,6 +347,10 @@ class Connector:
             if not image:
                 log.info("跳过 %s 的表情包（拿不到原图）", cid)
                 return
+        elif m.get("record"):
+            if not self.cfg["receive_records"]:
+                return
+            forward = self.remember_record(chat, m["record"], f"{m['local_id']}:{m['time']}")
         elif m["type"] != 1 or not m["text"]:
             if m["type"] != 10000:  # 10000 是「某某撤回了一条消息」这类系统提示
                 log.info("跳过 %s 的非文字消息 type=%s（只收文字、引用和表情包）", cid, m["type"])
@@ -361,17 +368,21 @@ class Connector:
                 text = self.at_pattern.sub("", text, count=1).strip()
             if image:
                 log.info("群 %s 里 %s 发了表情包", cid, uid)
+            elif forward:
+                log.info("群 %s 里 %s 转发了聊天记录（%d 条）", cid, uid, len(m["record"]["items"]))
             else:
                 log.info("群 %s 里 %s 发了文字 %d 字%s%s", cid, uid, len(text), "，@ 了小号" if at_self else "", quote_note)
             event = onebot.group_message_event(self.self_id, cid, uid, self.store.display_name(sender), mid,
-                                               text, at_self, int(m["time"]), reply_id, image)
+                                               text, at_self, int(m["time"]), reply_id, image, forward)
         else:
             if image:
                 log.info("收到 %s 的私聊表情包", cid)
+            elif forward:
+                log.info("收到 %s 的私聊聊天记录（%d 条）", cid, len(m["record"]["items"]))
             else:
                 log.info("收到 %s 的私聊文字 %d 字%s", cid, len(m["text"]), quote_note)
             event = onebot.private_message_event(self.self_id, cid, self.store.display_name(chat), mid,
-                                                 m["text"], int(m["time"]), reply_id, image)
+                                                 m["text"], int(m["time"]), reply_id, image, forward)
         if not self.cfg["receive_only"]:
             await self.ob.push(event)
 
@@ -409,17 +420,29 @@ class Connector:
         else:
             uid, name = self.state.id_of(author), quote["name"] or self.store.display_name(author)
         ts = quote["time"] or int(time.time())
+        # 引用的是聊天记录：被引用的那条做成合并转发，标题已经在「[聊天记录] 标题」里
+        forward = self.remember_record(chat, quote["record"], f"quote:{rid}") if quote.get("record") else None
+        text = "" if forward else quote["text"]
         if chat.endswith("@chatroom"):
             msg = onebot.group_message_event(self.self_id, self.state.id_of(chat), uid, name, rid,
-                                             quote["text"], False, ts)
+                                             text, False, ts, forward=forward)
         else:
-            msg = onebot.private_message_event(self.self_id, uid, name, rid, quote["text"], ts)
+            msg = onebot.private_message_event(self.self_id, uid, name, rid, text, ts, forward=forward)
         msg.pop("post_type")
         self.quoted[rid] = msg
         self.quoted.move_to_end(rid)
         while len(self.quoted) > 200:
             self.quoted.popitem(last=False)
         return rid
+
+    def remember_record(self, chat: str, record: dict, key: str) -> dict:
+        """把聊天记录记下来（最多 100 条），返回 forward 段要的 {id, title}；AstrBot 和插件用 get_forward_msg 按 id 来取"""
+        fid = str(onebot.stable_id(f"{chat}:record:{key}"))
+        self.records[fid] = {"record": record, "group": chat.endswith("@chatroom")}
+        self.records.move_to_end(fid)
+        while len(self.records) > 100:
+            self.records.popitem(last=False)
+        return {"id": fid, "title": record["title"]}
 
     # ---------- 回 ----------
 
@@ -458,6 +481,13 @@ class Connector:
         if action == "get_msg":
             msg = self.quoted.get(int(params.get("message_id") or 0))
             return ("ok", 0, msg) if msg else ("failed", 1404, {"message": "只能取到别人引用过的消息"})
+        if action == "get_forward_msg":  # 不同实现传的参数名不一样
+            fid = str(params.get("id") or params.get("message_id") or params.get("res_id") or params.get("resid") or "")
+            rec = self.records.get(fid)
+            if not rec:
+                return "failed", 1404, {"message": "只能取到最近收到的聊天记录"}
+            items = [{**i, "text": wxdb.record_text(i)} for i in rec["record"]["items"]]
+            return "ok", 0, onebot.forward_nodes(self.self_id, items, "group" if rec["group"] else "private")
         if action == "get_status":
             return "ok", 0, {"online": True, "good": True}
         if action == "get_version_info":
