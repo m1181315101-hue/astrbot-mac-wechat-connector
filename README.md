@@ -129,6 +129,8 @@ docker exec -u abc wechat /lsiopy/bin/python3 /opt/wechat-connector/bridge.py lo
 | `receive_only` | `true` 时只读消息、写日志，不连 AstrBot。第一次部署建议先开着试 |
 | `face_map` | 可选。如果 AstrBot 装了把 `[旺柴]` 这类文字换成 QQ 表情的插件（比如 [astrbot_plugin_face_convert](https://github.com/m1181315101-hue/dafeiyu-astrbot/tree/main/plugin/astrbot_plugin_face_convert)），把它的 `face_map.json` 复制到 `./data/wechat-connector/` 里再填这一项：回复里的 QQ 表情会翻回 `[旺柴]` 这种文字，微信会显示成表情 |
 | `max_sends_per_minute` | 每分钟最多发几条，默认 20，多出来的排队 |
+| `typing_delay` | 发文字前按字数停顿，像人在打字：`{"base": 0.5, "per_char": 0.05, "max": 3.0}`（秒）是默认值。想回得快一点可以缩到 `0.2 / 0.02 / 1.0` |
+| `poll_interval` | 每隔多少秒看一次消息库，默认 1.0。改成 0.5 收消息快半秒左右；没新消息时只比对文件，几乎不占 CPU |
 | `max_message_age` | 超过这么多秒的旧消息不转发，默认 600。连接器停了一段时间再启动时，不会回一堆过期消息 |
 | `group_voice_min_seconds` | 群里只发不短于这么多秒的语音，默认 20：点歌（翻唱）会发，随口的短语音不发，免得群里语音太多。设成 0 群里所有语音都发，设成 -1 群里一律不发。私聊不受影响。不发时会告诉 AstrBot「发送失败」，插件会改用文字回复 |
 | `media_dir` | 待发图片、语音的临时目录，默认 `/tmp/wechat-connector-media`，超过 10 分钟的自动清掉 |
