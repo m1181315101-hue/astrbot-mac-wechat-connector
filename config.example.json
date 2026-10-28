@@ -1,0 +1,11 @@
+{
+  "astrbot_ws_url": "ws://astrbot:6200/ws",
+  "access_token": "<和 AstrBot 平台里填的反向 WS 口令一致>",
+  "whitelist": ["<允许私聊的人的 wxid>"],
+  "group_whitelist": ["<允许的群的 wxid，形如 123456@chatroom>"],
+  "bot_names": [],
+  "receive_only": true,
+  "face_map": "/config/wechat-connector/face_map.json",
+  "max_sends_per_minute": 20,
+  "max_message_age": 600
+}
