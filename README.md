@@ -48,81 +48,81 @@
 
 - Docker。只在 **Apple 芯片的 Mac（arm64）** 上验证过。
 - 微信容器：[`nickrunning/wechat-selkies:0.0.17-minimal`](https://github.com/nickrunning/wechat-selkies)，里面是官方 Linux 微信 **4.1.13**。
-- 取密钥用的 `wxkey.py` **只支持 arm64 版微信**。x86_64 的机器可以用 [wcdb-key-tool](https://github.com/TANGandXUE/wcdb-key-tool) 取到 passphrase，再按下面第 3 步的格式写进 `keys.json`。
+- 取密钥用的 `wxkey.py` **只支持 arm64 版微信**。x86_64 的机器可以用 [wcdb-key-tool](https://github.com/TANGandXUE/wcdb-key-tool) 取到 passphrase，写进 `keys.json` 的 `passphrase` 字段（十六进制）。
 - 微信升级以后，数据库格式、密钥派生函数的位置、界面结构都可能变化，所以**容器镜像要钉住版本**，不要让微信自动更新。
 
 ## 部署
 
+微信容器的镜像用本目录的 [`docker/Dockerfile`](docker/Dockerfile) 构建，在 `nickrunning/wechat-selkies` 的基础上：
+
+- 装好 gdb、xdotool、xclip、无障碍组件（at-spi）、lame；
+- 设好 `PULSE_SERVER`（原镜像只给 `PULSE_RUNTIME_PATH=/defaults`，PulseAudio 要求这个目录归自己所有，微信就连不上声音服务，一点「发语音」就提示「未检测到麦克风设备」）；
+- `init-wxvmic`：PulseAudio 起来之后、桌面（微信）起来之前，建一个虚拟麦克风并设成默认输入。微信只在启动时找麦克风，而且不把 PulseAudio 的「监听源」当麦克风，所以必须在它启动前建好；
+- `svc-wechat-connector`：等配置、密钥、微信都就绪后自动启动连接器，挂了会被重新拉起。
+
 下面的命令都在 AstrBot 的 compose 目录里执行。
 
-### 1. 起微信容器
+### 1. 构建并启动微信容器
+
+把本目录放在 compose 目录下（或者改 `context` 指过来），在 compose 里加：
 
 ```yaml
-services:
   wechat:
-    image: nickrunning/wechat-selkies:0.0.17-minimal
+    build:
+      context: ./dafeiyu-astrbot/wechat-connector
+      dockerfile: docker/Dockerfile
+    image: dafeiyu/wechat-connector:local
     container_name: wechat
+    hostname: wechat            # 固定主机名：换了的话微信可能当成新设备，要重新登录
+    profiles: ["wechat"]        # 只能点名启停，不会被 docker compose up -d 顺手带起来
+    restart: unless-stopped
     ports:
       - "127.0.0.1:3001:3001"   # 网页桌面，只绑本机
     volumes:
-      - ./wechat:/config        # 微信登录态、聊天数据库、连接器配置都在这里
+      - ./wechat:/config        # 微信登录态、聊天数据库、连接器的配置和密钥都在这里
     cap_add:
-      - SYS_PTRACE              # 第 3 步取密钥要用
+      - SYS_PTRACE              # 第 2 步取密钥要用
     environment:
       - PUID=1000
       - PGID=100
       - TZ=Asia/Shanghai
       - LC_ALL=zh_CN.UTF-8
       - AUTO_START_WECHAT=true
-      - CUSTOM_USER=<网页登录用户名>
-      - PASSWORD=<网页登录密码>
+      - AUTO_START_QQ=false
+      - CUSTOM_USER=${WECHAT_WEB_USER}       # 网页桌面的账号密码，写在同目录 .env 里（权限 600）
+      - PASSWORD=${WECHAT_WEB_PASSWORD}
     shm_size: 1gb
 ```
 
-微信容器要和 AstrBot 在同一个 Docker 网络里。如果它是单独起的，就接进去：
-
 ```bash
-docker network connect <AstrBot 所在的网络> wechat
+docker compose --profile wechat up -d --build wechat
 ```
 
-### 2. 在容器里装工具
+它和 AstrBot 在同一个 compose 里，所以自动在同一个网络，能用 `astrbot` 这个名字连过去。
 
-```bash
-docker exec -u 0 wechat sh -c 'apt-get update && apt-get install -y --no-install-recommends gdb xdotool xclip at-spi2-core gir1.2-atspi-2.0 lame'
-docker cp connector wechat:/config/wechat-connector/connector
-docker exec -u 0 wechat chown -R abc:users /config/wechat-connector
-```
-
-> 这些是装在容器里的，容器删掉重建就没了，要重新装。
-
-**语音条还要两个条件**（缺了也能用，只是语音会退回成 mp3 文件）：
-
-1. **微信要能连上声音服务**：这个镜像给微信的环境里只有 `PULSE_RUNTIME_PATH=/defaults`，而 PulseAudio 要求这个目录归自己所有，微信就连不上，一点「发语音」就提示「未检测到麦克风设备」。要让微信带着 `PULSE_SERVER=unix:/defaults/native` 启动。
-2. **微信启动前要有虚拟麦克风**：微信只在启动时找麦克风，而且不把 PulseAudio 的「监听源」当麦克风。连接器的界面驱动启动时会自动建一个（null sink `wxvmic_sink` 加 remap source `wxvmic`，设成默认输入），建好以后要**重启一次微信**。网页桌面原来的推流会留在原设备上，不受影响。
-
-### 3. 扫码登录，同时抓密钥
+### 2. 扫码登录，同时抓密钥
 
 **先挂断点，再扫码。** 新版微信只在登录那一刻派生数据库密钥。
 
 ```bash
 # 先运行，等它提示「现在扫码登录」
-docker exec -u 0 wechat /usr/bin/python3 /config/wechat-connector/connector/wxkey.py capture
+docker exec -u 0 wechat /usr/bin/python3 /opt/wechat-connector/wxkey.py capture
 ```
 
 然后在浏览器打开 `https://localhost:3001`，用**小号**扫码登录。抓到之后运行：
 
 ```bash
-docker exec -u 0 wechat /usr/bin/python3 /config/wechat-connector/connector/wxkey.py verify
+docker exec -u 0 wechat /usr/bin/python3 /opt/wechat-connector/wxkey.py verify
 ```
 
-看到「校验通过 N/N 个库」就说明成功了，结果存在 `/config/wechat-connector/keys.json`。以后容器重启、微信重启都不用再抓，只有换号或者重新登录时才要重来一遍。
+看到「校验通过 N/N 个库」就说明成功了，结果存在 `/config/wechat-connector/keys.json`（权限 600）。以后容器重启、微信重启（会自动登录）都不用再抓，只有换号或者在手机上退出、重新扫码时才要重来一遍。
 
-### 4. 写配置
+### 3. 写配置
 
-把 [`config.example.json`](config.example.json) 复制成容器里的 `/config/wechat-connector/config.json`，权限设成 600。白名单要填 wxid，可以按备注名或昵称查（必须完全一致）：
+把 [`config.example.json`](config.example.json) 复制成 `./wechat/wechat-connector/config.json`（容器里是 `/config/wechat-connector/config.json`），权限设成 600。白名单要填 wxid，可以按备注名或昵称查（必须完全一致）：
 
 ```bash
-docker exec -u abc wechat /lsiopy/bin/python3 /config/wechat-connector/connector/bridge.py lookup "<备注名或群名>"
+docker exec -u abc wechat /lsiopy/bin/python3 /opt/wechat-connector/bridge.py lookup "<备注名或群名>"
 ```
 
 它会打印出 wxid、类型（联系人或群），以及连接器给这个号的 **OneBot 号**（一个整数）。AstrBot 那边看到的 QQ 号、群号就是这个数。
@@ -135,14 +135,14 @@ docker exec -u abc wechat /lsiopy/bin/python3 /config/wechat-connector/connector
 | `group_whitelist` | 允许的群（`xxx@chatroom` 列表） |
 | `bot_names` | 群里 @ 小号时可能用的名字（比如小号的群昵称）。小号自己的微信昵称会自动加上 |
 | `receive_only` | `true` 时只读消息、写日志，不连 AstrBot。第一次部署建议先开着试 |
-| `face_map` | 可选，指向 QQ 表情插件的 `face_map.json`。AstrBot 回复里的 QQ 表情会翻回 `[旺柴]` 这种文字，微信会显示成表情 |
+| `face_map` | 可选，指向 QQ 表情插件的 `face_map.json`（复制到 `./wechat/wechat-connector/` 里）。AstrBot 回复里的 QQ 表情会翻回 `[旺柴]` 这种文字，微信会显示成表情 |
 | `max_sends_per_minute` | 每分钟最多发几条，默认 20，多出来的排队 |
 | `max_message_age` | 超过这么多秒的旧消息不转发，默认 600。连接器停了一段时间再启动时，不会回一堆过期消息 |
 | `group_voice_min_seconds` | 群里只发不短于这么多秒的语音，默认 20：点歌（翻唱）会发，随口的短语音不发，免得群里语音太多。设成 0 群里所有语音都发，设成 -1 群里一律不发。私聊不受影响。不发时会告诉 AstrBot「发送失败」，插件会改用文字回复 |
 | `media_dir` | 待发图片、语音的临时目录，默认 `/tmp/wechat-connector-media`，超过 10 分钟的自动清掉 |
 | `voice_mode` | `native`（默认）发原生语音条，失败时退回 mp3 文件；`file` 一律发 mp3 文件 |
 
-### 5. AstrBot 里加一个平台
+### 4. AstrBot 里加一个平台
 
 在 AstrBot 面板「消息平台」里新增 **OneBot v11（aiocqhttp）**：
 
@@ -154,20 +154,22 @@ docker exec -u abc wechat /lsiopy/bin/python3 /config/wechat-connector/connector
 
 如果装了「只在指定群回复」这类插件，记得把群的 **OneBot 号**（`lookup` 打出来的那个整数）加进它的白名单。
 
-### 6. 启动
+### 5. 启动和检查
+
+有了 `config.json` 和 `keys.json` 以后，连接器会在一分钟内自己启动（或者 `docker restart wechat`）。AstrBot 日志里多出一条「aiocqhttp(OneBot v11) 适配器已连接」，就说明连上了。
 
 ```bash
 # 检查：密钥、数据库、通讯录、界面驱动是不是都就绪
-docker exec -u abc wechat /lsiopy/bin/python3 /config/wechat-connector/connector/bridge.py check
+docker exec -u abc wechat /lsiopy/bin/python3 /opt/wechat-connector/bridge.py check
 
-# 自测发送：给「文件传输助手」发一段文字、一张图、一个动图、一段语音（不经过 AstrBot）
-docker exec -u abc wechat /lsiopy/bin/python3 /config/wechat-connector/connector/bridge.py test-media
-
-# 后台运行
-docker exec -d -u abc wechat sh -c 'cd /config/wechat-connector && exec /lsiopy/bin/python3 -u connector/bridge.py run >> stdout.log 2>&1'
+# 自测发送：给「文件传输助手」发一段文字、一张图、一个动图、一段语音条（不经过 AstrBot）。
+# 先停常驻服务，免得两边同时操作界面，测完再开
+docker exec -u 0 wechat s6-svc -d /run/service/svc-wechat-connector
+docker exec -u abc wechat /lsiopy/bin/python3 /opt/wechat-connector/bridge.py test-media --config /config/wechat-connector/config.json
+docker exec -u 0 wechat s6-svc -u /run/service/svc-wechat-connector
 ```
 
-日志在 `/config/wechat-connector/connector.log`。AstrBot 日志里出现第二条「aiocqhttp(OneBot v11) 适配器已连接」，就说明连上了。
+日志在 `./wechat/wechat-connector/connector.log`，也可以看 `docker logs wechat`。
 
 ## 安全设计
 
@@ -178,7 +180,7 @@ docker exec -d -u abc wechat sh -c 'cd /config/wechat-connector && exec /lsiopy/
 | 不点错 | 搜索结果只认对应分组（私聊只认「联系人」，群只认「群聊」）里名字完全相同的那一项，「搜索网络结果」「聊天记录」永远不点；同名的不止一个就放弃 |
 | 不标已读 | 会话列表里点不开时，直接改用搜索，不靠「先点别的会话再点回来」，免得把别人的消息标成已读 |
 | 限速 | 每分钟最多 `max_sends_per_minute` 条；打字前按字数停顿 0.5～3 秒 |
-| 急停 | 在 `/config/wechat-connector/` 里放一个名为 `STOP` 的文件，就只收不发，删掉恢复 |
+| 急停 | 在 `./wechat/wechat-connector/` 里放一个名为 `STOP` 的文件，就只收不发，删掉恢复 |
 | 发后确认 | 发完回查数据库，确认真的多了一条自己发出的消息 |
 | 隐私 | 日志只记 OneBot 号、时间和字数，不记内容；解密后的明文只在内存里，不写盘 |
 

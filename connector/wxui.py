@@ -78,13 +78,14 @@ def ensure_virtual_mic() -> bool:
     previous = info.get("default_source_name", "") if isinstance(info, dict) else ""
     if previous != VMIC_SOURCE:
         subprocess.run(["pactl", "set-default-source", VMIC_SOURCE], capture_output=True, check=False)
-        vmic_index = next((x.get("index") for x in pactl_json("list", "short", "sources")
-                           if x.get("name") == VMIC_SOURCE), None)
-        for out in pactl_json("list", "source-outputs"):
-            binary = (out.get("properties") or {}).get("application.process.binary", "")
-            if out.get("source") == vmic_index and binary != "wechat" and previous:
-                subprocess.run(["pactl", "move-source-output", str(out.get("index")), previous],
-                               capture_output=True, check=False)
+    # 网页桌面的推流（pcmflux）该录桌面声音 output.monitor；跟着默认输入跑到虚拟麦克风上的挪回去
+    names = {x.get("index"): x.get("name") for x in pactl_json("list", "short", "sources")}
+    home = "output.monitor" if "output.monitor" in names.values() else (previous if previous != VMIC_SOURCE else "")
+    for out in pactl_json("list", "source-outputs"):
+        binary = (out.get("properties") or {}).get("application.process.binary", "")
+        if names.get(out.get("source")) == VMIC_SOURCE and binary != "wechat" and home:
+            subprocess.run(["pactl", "move-source-output", str(out.get("index")), home],
+                           capture_output=True, check=False)
     return VMIC_SOURCE in [x.get("name") for x in pactl_json("list", "short", "sources")]
 
 

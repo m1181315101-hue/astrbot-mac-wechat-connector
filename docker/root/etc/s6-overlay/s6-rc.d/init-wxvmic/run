@@ -1,0 +1,16 @@
+#!/usr/bin/with-contenv bash
+# 微信只在启动时找麦克风，而且不把 PulseAudio 的「监听源」当麦克风：
+# 在桌面（微信）起来之前，建一个虚拟麦克风（null sink + 把它的监听源包装成普通输入设备）并设为默认输入。
+# 连接器发语音条时把音频播进 wxvmic_sink，微信从 wxvmic 录到的就是这段音频。
+for _ in $(seq 1 120); do
+  s6-setuidgid abc pactl info >/dev/null 2>&1 && break
+  sleep 0.5
+done
+if ! s6-setuidgid abc pactl list short sources | awk '{print $2}' | grep -qx wxvmic; then
+  s6-setuidgid abc pactl load-module module-null-sink sink_name=wxvmic_sink \
+    sink_properties=device.description=WxVirtualMicSink >/dev/null
+  s6-setuidgid abc pactl load-module module-remap-source master=wxvmic_sink.monitor \
+    source_name=wxvmic source_properties=device.description=WxVirtualMic >/dev/null
+fi
+s6-setuidgid abc pactl set-default-source wxvmic
+echo "[init-wxvmic] 虚拟麦克风就绪"

@@ -1,0 +1,15 @@
+#!/usr/bin/with-contenv bash
+# 微信连接器：等配置、密钥和微信都就绪了再启动；没就绪就过一会儿重试（s6 会重新拉起）
+CONF=/config/wechat-connector/config.json
+KEYS=/config/wechat-connector/keys.json
+if [ ! -f "$CONF" ] || [ ! -f "$KEYS" ]; then
+  echo "[wechat-connector] 还没有 config.json 或 keys.json（见 README 第 3、4 步），60 秒后再看"
+  sleep 60
+  exit 0
+fi
+until pgrep -x wechat >/dev/null; do
+  sleep 2
+done
+sleep 5  # 等微信主窗口和无障碍桥起来
+cd /config/wechat-connector
+exec s6-setuidgid abc /lsiopy/bin/python3 -u /opt/wechat-connector/bridge.py run --config "$CONF"
