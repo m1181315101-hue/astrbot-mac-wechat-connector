@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """微信 ↔ AstrBot 连接器（OneBot v11）
 
-收：轮询本地数据库（wxdb），白名单里的人（私聊）和白名单里的群发来的新文字 → OneBot 消息事件 → AstrBot
+收：轮询本地数据库（wxdb），白名单里的人（私聊；写 "*" 就是所有好友）和白名单里的群发来的新文字 → OneBot 消息事件 → AstrBot
     群里有人 @ 小号时，事件前面加一个 at 段，AstrBot 按「被 @」处理
 回：AstrBot 的 send_private_msg / send_group_msg → 发送队列 → 界面驱动（wxui）切换会话、核对、粘贴、回车
     → 回查数据库确认。文字、图片（GIF 是动画表情）、语音（原生语音条，不行就退回 mp3 文件）按原顺序一段一段发
@@ -204,7 +204,8 @@ class Connector:
         self.keys = wxdb.KeyStore(os.path.join(self.state_dir, "keys.json"))
         self.store = wxdb.WeChatStore(cfg["files_root"], self.keys)
         self.state = State(os.path.join(self.state_dir, "state.json"))
-        self.whitelist = set(cfg["whitelist"])
+        self.all_friends = "*" in cfg["whitelist"]  # "*"：通讯录里的所有好友都能私聊
+        self.whitelist = {w for w in cfg["whitelist"] if w != "*"}
         self.groups = {g for g in cfg["group_whitelist"] if g.endswith("@chatroom")}
         self.self_id = onebot.stable_id(self.store.self_wxid)
         self.ui = UiDriver(cfg["ui_python"], wechat_env())
@@ -225,10 +226,13 @@ class Connector:
         async with self.db_lock:
             return await asyncio.to_thread(self.store.refresh)
 
+    def private_targets(self) -> set[str]:
+        return self.whitelist | (self.store.friends() if self.all_friends else set())
+
     async def init_marks(self) -> None:
         """启动时：已经存在的会话从最新一条开始，不回放历史；之后才出现的会话表从头读"""
         await self._refresh()
-        for wxid in self.whitelist | self.groups:
+        for wxid in self.private_targets() | self.groups:
             marks = self.state.marks.setdefault(wxid, {})
             for db, latest in self.store.latest_ids(wxid).items():
                 marks.setdefault(db, latest)
@@ -252,7 +256,9 @@ class Connector:
                     warned = True
                 continue
             changed = False
-            for wxid in self.whitelist | self.groups:
+            async with self.db_lock:
+                targets = await asyncio.to_thread(self.private_targets)
+            for wxid in targets | self.groups:
                 marks = self.state.marks.setdefault(wxid, {})
                 before = dict(marks)
                 async with self.db_lock:
@@ -348,7 +354,11 @@ class Connector:
 
     async def send_to(self, target_id: str, params: dict, group: bool):
         wxid = self.state.ids.get(target_id)
-        allowed = self.groups if group else self.whitelist
+        if group:
+            allowed = self.groups
+        else:
+            async with self.db_lock:  # 好友列表要读联系人库，别和轮询线程同时刷新
+                allowed = await asyncio.to_thread(self.private_targets)
         if not wxid or wxid not in allowed:
             log.warning("拒绝发送：%s 不在%s白名单", target_id, "群" if group else "")
             return "failed", 1403, {"message": "目标不在白名单"}
@@ -463,7 +473,8 @@ class Connector:
         return False
 
     async def run(self) -> None:
-        log.info("微信连接器 %s 启动：白名单 %d 人、%d 个群，%s", VERSION, len(self.whitelist), len(self.groups),
+        people = f"所有好友（{len(self.private_targets())} 人）" if self.all_friends else f"{len(self.whitelist)} 人"
+        log.info("微信连接器 %s 启动：私聊白名单 %s、%d 个群，%s", VERSION, people, len(self.groups),
                  "只收不发" if self.cfg["receive_only"] else f"连 {self.cfg['astrbot_ws_url']}")
         await self.init_marks()
         ping = await asyncio.to_thread(self.ui.request, {"op": "ping"}, 20.0)
@@ -481,9 +492,10 @@ def cmd_check(cfg: dict) -> int:
     store.refresh()
     print("消息库：", ", ".join(f"{os.path.basename(p)}={'可读' if d.con else '不可读'}" for p, d in store.msg_dbs.items()))
     print("通讯录条目：", len(store.contacts()))
-    listed = cfg["whitelist"] + cfg["group_whitelist"]
+    listed = [w for w in cfg["whitelist"] if w != "*"] + cfg["group_whitelist"]
     missing = [w for w in listed if w not in store.contacts()]
-    print("白名单：", len(cfg["whitelist"]), "人、", len(cfg["group_whitelist"]), "个群",
+    people = f"所有好友（{len(store.friends())} 人）" if "*" in cfg["whitelist"] else f"{len(cfg['whitelist'])} 人"
+    print("白名单：", people, "、", len(cfg["group_whitelist"]), "个群",
           f"（通讯录里找不到 {len(missing)} 个）" if missing else "")
     resp = UiDriver(cfg["ui_python"], wechat_env()).request({"op": "ping"}, 20.0)
     print("界面驱动：", "就绪" if resp.get("ok") else f"不可用 {resp}")

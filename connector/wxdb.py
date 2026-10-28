@@ -270,6 +270,8 @@ class WeChatStore:
         self.contact_db = PlainDB(os.path.join(self.acct_dir, "db_storage", "contact", "contact.db"), keystore)
         self._contacts: dict[str, str] = {}
         self._contacts_sig = None
+        self._friends: set[str] = set()
+        self._friends_sig = None
         self._scan_shards()
 
     def _scan_shards(self) -> None:
@@ -293,6 +295,17 @@ class WeChatStore:
             self._contacts = {u: (r or n or u) for u, r, n in rows if u}
             self._contacts_sig = self.contact_db.con
         return self._contacts
+
+    def friends(self) -> set[str]:
+        """通讯录里的个人好友（local_type=1）：不含群、公众号、系统账号和自己；群成员这类陌生人是 local_type=3"""
+        self.contacts()  # 顺带刷新联系人库
+        if self._friends_sig is not self.contact_db.con:
+            rows = self.contact_db.con.execute("select username from contact where local_type = 1").fetchall()
+            self._friends = {u for (u,) in rows
+                             if u and u != self.self_wxid and "@" not in u and not u.startswith("gh_")
+                             and u.lower() not in SYSTEM_IDS}
+            self._friends_sig = self.contact_db.con
+        return self._friends
 
     def self_name(self) -> str:
         return self.contacts().get(self.self_wxid, "")
