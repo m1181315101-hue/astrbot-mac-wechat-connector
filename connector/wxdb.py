@@ -405,8 +405,9 @@ class WeChatStore:
                             "sender": names.get(sender, ""), "text": text, "quote": quote})
         return out
 
-    def self_count(self, wxid: str, since: int, types: tuple[int, ...]) -> int:
-        """这个会话里 since 之后自己发出的、类型在 types 里的消息有几条（发图片、文件后用来确认）"""
+    def self_count(self, wxid: str, since: int, types: tuple) -> int:
+        """这个会话里 since 之后自己发出的、类型在 types 里的消息有几条（发图片、文件后用来确认）。
+        types 里可以写基础类型（如 3），也可以写（基础类型, 子类型）：粘贴 GIF 后微信存成动画表情附件 (49, 8)"""
         table, n = self.table_of(wxid), 0
         for db in self.msg_dbs.values():
             con = db.con
@@ -415,7 +416,8 @@ class WeChatStore:
             me = self._self_rowid(con)
             for (lt,) in con.execute(f"select local_type from {table} where create_time >= ? and real_sender_id = ?",
                                      (since, me)):
-                n += (lt & 0xFFFFFFFF) in types
+                base, sub = lt & 0xFFFFFFFF, lt >> 32
+                n += base in types or (base, sub) in types
         return n
 
     def sent_since(self, wxid: str, since: int, text: str) -> bool:

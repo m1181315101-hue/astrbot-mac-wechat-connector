@@ -35,9 +35,11 @@ import media  # noqa: E402
 import onebot  # noqa: E402
 import wxdb  # noqa: E402
 
-VERSION = "0.5.0"
+VERSION = "0.5.1"
 HERE = os.path.dirname(os.path.abspath(__file__))
 # 界面驱动的这些失败都发生在回车之前（回车前核对失败时已经清空输入框），一个字都没发出去，可以重试
+# 发图片后回查数据库确认用：PNG/JPG 存成图片 3，GIF 粘贴后存成动画表情附件 (49, 8)，有时是表情 47
+IMAGE_TYPES = (3, 47, (49, 8))
 RETRYABLE = ("粘贴前核对失败", "回车前核对失败", "没找到搜索框", "打开后输入框名字对不上", "找不到微信主窗口")
 log = logging.getLogger("wechat-connector")
 
@@ -467,7 +469,7 @@ class Connector:
                             break
                     else:
                         ok, why = await self._send_one(label, wxid, name, sections, use_list, file=path,
-                                                       types=(3, 47) if kind == "image" else (49,))
+                                                       types=IMAGE_TYPES if kind == "image" else (49,))
             if ok:
                 sent += 1
             else:
