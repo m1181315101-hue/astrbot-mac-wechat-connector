@@ -154,22 +154,17 @@ def first_line(node) -> str:
         return ""
 
 
-_SCALE = None
-
-
 def scale() -> float:
-    """AT-SPI 给的是逻辑坐标，xdotool 用物理像素：比例 = X 窗口宽 / 无障碍主窗口宽"""
-    global _SCALE
-    if _SCALE is None:
-        _SCALE = 1.0
-        frame = main_frame()
-        if frame is not None:
-            w = ext(frame)[2]
-            for wid in sh("xdotool", "search", "--onlyvisible", "--name", "^微信$").split():
-                geo = dict(l.split("=", 1) for l in sh("xdotool", "getwindowgeometry", "--shell", wid).splitlines())
-                if w and int(geo.get("WIDTH", 0)) > w:
-                    _SCALE = int(geo["WIDTH"]) / w
-    return _SCALE
+    """AT-SPI 给的是逻辑坐标，xdotool 用物理像素：比例 = X 窗口宽 / 无障碍主窗口宽。
+    每次现算：窗口隐藏时无障碍宽度是 0，缓存下来会一直错"""
+    frame = main_frame()
+    w = ext(frame)[2] if frame is not None else 0
+    wid = big_window()
+    if w and wid:
+        geo = dict(l.split("=", 1) for l in sh("xdotool", "getwindowgeometry", "--shell", wid).splitlines())
+        if int(geo.get("WIDTH", 0)) > w:
+            return int(geo["WIDTH"]) / w
+    return 1.0
 
 
 def click(node) -> None:
@@ -322,6 +317,42 @@ def send_voice(target: str, path: str, seconds: float, how: str) -> dict:
     return {"ok": True, "path": how}
 
 
+def frame_visible() -> bool:
+    frame = main_frame()
+    return frame is not None and ext(frame)[2] > 0
+
+
+def big_window() -> str:
+    for wid in sh("xdotool", "search", "--onlyvisible", "--name", "^微信$").split():
+        geo = dict(l.split("=", 1) for l in sh("xdotool", "getwindowgeometry", "--shell", wid).splitlines())
+        if int(geo.get("WIDTH", 0)) > 400:  # 托盘图标和小浮窗也叫这个名字，只要大窗口
+            return wid
+    return ""
+
+
+def show_main_window() -> bool:
+    """主窗口被关到托盘（点了右上角 ×）就点托盘图标让微信自己打开（用 xdotool 强行映射的话，
+    微信仍认为窗口是隐藏的，无障碍树里大小一直是 0）；窗口太窄时微信会切成单栏、藏起会话列表和搜索框，
+    调到 1760×1280。返回主窗口最后是否可用"""
+    if not frame_visible():
+        log("主窗口被收进了托盘，点托盘图标打开")
+        for tray in sh("xdotool", "search", "--name", "^stalonetray$").split():
+            geo = dict(l.split("=", 1) for l in sh("xdotool", "getwindowgeometry", "--shell", tray).splitlines())
+            sh("xdotool", "mousemove", str(int(geo["X"]) + 12), str(int(geo["Y"]) + 12), "click", "1")
+            break
+        deadline = time.time() + 5
+        while time.time() < deadline and not frame_visible():
+            time.sleep(0.3)
+    wid = big_window()
+    if wid:
+        geo = dict(l.split("=", 1) for l in sh("xdotool", "getwindowgeometry", "--shell", wid).splitlines())
+        if int(geo.get("WIDTH", 0)) < 1600 or int(geo.get("HEIGHT", 0)) < 1100:
+            sh("xdotool", "windowsize", wid, "1760", "1280")
+            time.sleep(1.0)
+        sh("xdotool", "windowactivate", "--sync", wid)
+    return frame_visible()
+
+
 def handle_send(req: dict) -> dict:
     target = req["name"]
     text, path, voice = req.get("text", ""), req.get("file", ""), req.get("voice", "")
@@ -330,11 +361,8 @@ def handle_send(req: dict) -> dict:
     for f in (path, voice):
         if f and not os.path.isfile(f):
             return {"ok": False, "reason": "要发的文件不存在"}
-    if main_frame() is None:
-        return {"ok": False, "reason": "无障碍树里没有微信主窗口"}
-    wid = sh("xdotool", "search", "--onlyvisible", "--name", "^微信$").split()
-    if wid:
-        sh("xdotool", "windowactivate", "--sync", wid[0])
+    if not show_main_window() or main_frame() is None:
+        return {"ok": False, "reason": "找不到微信主窗口（没登录，或者被关掉了）"}
     ok, how = open_chat(target, set(req.get("sections") or ["联系人"]), bool(req.get("use_list")))
     if not ok:
         return {"ok": False, "reason": how}
@@ -368,7 +396,7 @@ def main() -> None:
             req = json.loads(line)
             op = req.get("op")
             if op == "ping":
-                resp = {"ok": main_frame() is not None}
+                resp = {"ok": show_main_window() and main_frame() is not None}
             elif op == "send":
                 resp = handle_send(req)
             else:
