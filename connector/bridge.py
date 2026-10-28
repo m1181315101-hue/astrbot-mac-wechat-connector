@@ -7,6 +7,8 @@
     引用的是小号的话，AstrBot 当成在叫它（和 QQ 上回复机器人的消息一样）
 回：AstrBot 的 send_private_msg / send_group_msg → 发送队列 → 界面驱动（wxui）切换会话、核对、粘贴、回车
     → 回查数据库确认。文字、图片（GIF 是动画表情）、语音（原生语音条，不行就退回 mp3 文件）按原顺序一段一段发
+    界面只有一个：所有要发的消息按到达顺序排成一队，一条（含它的所有段）发完再发下一条；
+    界面没动过、一个字没发出去的失败（核对没过、没找到搜索框）等 2 秒重试一次
 
 用法（在微信容器里，用和微信相同的用户运行）：
   python3 bridge.py run    [--config /config/wechat-connector/config.json]
@@ -33,8 +35,10 @@ import media  # noqa: E402
 import onebot  # noqa: E402
 import wxdb  # noqa: E402
 
-VERSION = "0.4.0"
+VERSION = "0.5.0"
 HERE = os.path.dirname(os.path.abspath(__file__))
+# 界面驱动的这些失败都发生在回车之前（回车前核对失败时已经清空输入框），一个字都没发出去，可以重试
+RETRYABLE = ("粘贴前核对失败", "回车前核对失败", "没找到搜索框", "打开后输入框名字对不上", "找不到微信主窗口")
 log = logging.getLogger("wechat-connector")
 
 DEFAULTS = {
@@ -55,6 +59,7 @@ DEFAULTS = {
     "media_dir": "/tmp/wechat-connector-media",
     "group_voice_min_seconds": 20,
     "voice_mode": "native",
+    "max_queue_wait": 150,  # 排队超过这么多秒还没轮到就不发了（AstrBot 等回执最多 180 秒，超时后插件可能已经改发文字）
 }
 
 
@@ -212,7 +217,8 @@ class Connector:
         self.self_id = onebot.stable_id(self.store.self_wxid)
         self.ui = UiDriver(cfg["ui_python"], wechat_env())
         self.db_lock = asyncio.Lock()
-        self.send_lock = asyncio.Lock()
+        self.send_queue: asyncio.Queue = asyncio.Queue()
+        self.sending = False  # 发送队列正在发一条
         self.sent_times: deque[float] = deque()
         self.at_pattern = None  # init_marks 里按小号昵称生成
         self.quoted: OrderedDict[int, dict] = OrderedDict()  # 被引用的消息，给 get_msg 用
@@ -384,6 +390,37 @@ class Connector:
         return self.store.display_name(wxid) if wxid else ""
 
     async def send_to(self, target_id: str, params: dict, group: bool):
+        """先排队再检查：检查要读库（会让出控制权），放在排队前面的话后到的消息可能插队。
+        等这条发完（或被拒）再回 AstrBot"""
+        future = asyncio.get_running_loop().create_future()
+        ahead = self.send_queue.qsize() + self.sending
+        self.send_queue.put_nowait((time.time(), target_id, params, group, future))
+        if ahead:
+            log.info("发给 %s 的消息排队，前面还有 %d 条", target_id, ahead)
+        return await future
+
+    async def send_worker(self) -> None:
+        while True:
+            queued_at, target_id, params, group, future = await self.send_queue.get()
+            self.sending = True
+            waited = time.time() - queued_at
+            try:
+                if waited > self.cfg["max_queue_wait"]:
+                    log.warning("发给 %s 的消息排队 %.0f 秒还没轮到，不发了", target_id, waited)
+                    result = ("failed", 1504, {"message": "排队太久，没发"})
+                else:
+                    if waited >= 5:
+                        log.info("发给 %s 的消息排队 %.0f 秒后开始发", target_id, waited)
+                    result = await self._send_job(target_id, params, group)
+            except Exception as e:  # 一条出错不能让整个队列停掉
+                log.exception("发给 %s 时出错", target_id)
+                result = ("failed", 1500, {"message": f"发送出错：{type(e).__name__}"})
+            finally:
+                self.sending = False
+            if not future.done():
+                future.set_result(result)
+
+    async def _send_job(self, target_id: str, params: dict, group: bool):
         wxid = self.state.ids.get(target_id)
         if group:
             allowed = self.groups
@@ -398,7 +435,7 @@ class Connector:
             log.info("丢掉不支持的消息段 %s", dropped)
         if not parts:
             return "failed", 1400, {"message": "没有能发的内容（只支持文字、图片、语音）"}
-        if os.path.exists(os.path.join(self.state_dir, "STOP")):
+        if os.path.exists(os.path.join(self.state_dir, "STOP")):  # 排队期间放的 STOP 也算
             log.warning("有 STOP 文件，暂停发送")
             return "failed", 1503, {"message": "连接器已暂停发送"}
         name = self.store.display_name(wxid)
@@ -406,35 +443,35 @@ class Connector:
         return await self.send_parts(target_id, wxid, name, sections, parts, group)
 
     async def send_parts(self, label: str, wxid: str, name: str, sections: list[str], parts, group: bool):
-        """一段一段发；有一段发出去就算成功，全都没发出去才回失败（带上原因，插件好改用文字）"""
+        """一段一段发；有一段发出去就算成功，全都没发出去才回失败（带上原因，插件好改用文字）。
+        只能由发送队列（或单独跑的自测）调用：界面同一时间只能有一个人用"""
         sent, reasons = 0, []
         use_list = self.store.name_is_unique(wxid) if wxid != "filehelper" else True
-        async with self.send_lock:  # 界面只有一个：一条一条来
-            for kind, value in parts:
-                if kind == "text":
-                    ok, why = await self._send_one(label, wxid, name, sections, use_list, text=value)
-                else:
-                    items, why, data = await asyncio.to_thread(self._prepare_media, kind, value, group)
-                    ok = False
-                    for i, (how, path, secs) in enumerate(items):
-                        if how == "voice":
-                            ok, why = await self._send_one(label, wxid, name, sections, use_list, voice=path,
-                                                           seconds=secs, types=(34,))
-                            if not ok and i == 0:  # 第一段就没发出去：整段退回成音频文件
-                                log.warning("语音条没发出去（%s），改发音频文件", why)
-                                fallback, why, _ = await asyncio.to_thread(self._voice_as_file, data,
-                                                                           sum(x[2] for x in items))
-                                for _how, fpath, _secs in fallback:
-                                    ok, why = await self._send_one(label, wxid, name, sections, use_list,
-                                                                   file=fpath, types=(49,))
-                                break
-                        else:
-                            ok, why = await self._send_one(label, wxid, name, sections, use_list, file=path,
-                                                           types=(3, 47) if kind == "image" else (49,))
-                if ok:
-                    sent += 1
-                else:
-                    reasons.append(why)
+        for kind, value in parts:
+            if kind == "text":
+                ok, why = await self._send_one(label, wxid, name, sections, use_list, text=value)
+            else:
+                items, why, data = await asyncio.to_thread(self._prepare_media, kind, value, group)
+                ok = False
+                for i, (how, path, secs) in enumerate(items):
+                    if how == "voice":
+                        ok, why = await self._send_one(label, wxid, name, sections, use_list, voice=path,
+                                                       seconds=secs, types=(34,))
+                        if not ok and i == 0:  # 第一段就没发出去：整段退回成音频文件
+                            log.warning("语音条没发出去（%s），改发音频文件", why)
+                            fallback, why, _ = await asyncio.to_thread(self._voice_as_file, data,
+                                                                       sum(x[2] for x in items))
+                            for _how, fpath, _secs in fallback:
+                                ok, why = await self._send_one(label, wxid, name, sections, use_list,
+                                                               file=fpath, types=(49,))
+                            break
+                    else:
+                        ok, why = await self._send_one(label, wxid, name, sections, use_list, file=path,
+                                                       types=(3, 47) if kind == "image" else (49,))
+            if ok:
+                sent += 1
+            else:
+                reasons.append(why)
         if sent:
             return "ok", 0, {"message_id": onebot.stable_id(f"out:{time.time_ns()}")}
         return "failed", 1500, {"message": "；".join(reasons) or "发送失败"}
@@ -481,6 +518,10 @@ class Connector:
             req = {"op": "send", "name": name, "sections": sections, "use_list": use_list, "delay": 0.3}
             req.update({"voice": voice, "seconds": seconds} if voice else {"file": file})
         resp = await asyncio.to_thread(self.ui.request, req, 40.0 + seconds)
+        if not resp.get("ok") and str(resp.get("reason", "")).startswith(RETRYABLE):
+            log.info("发给 %s 没成（%s），2 秒后重试一次", label, resp.get("reason"))
+            await asyncio.sleep(2.0)
+            resp = await asyncio.to_thread(self.ui.request, req, 40.0 + seconds)
         what = f"{len(text)} 字" if text else (f"语音条 {seconds:.0f} 秒" if voice else os.path.basename(file))
         if not resp.get("ok"):
             log.warning("发给 %s 失败（%s）：%s", label, what, resp.get("reason"))
@@ -512,6 +553,7 @@ class Connector:
         log.info("界面驱动：%s", "就绪" if ping.get("ok") else "没找到微信主窗口（检查无障碍组件）")
         tasks = [asyncio.create_task(self.poll_loop())]
         if not self.cfg["receive_only"]:
+            tasks.append(asyncio.create_task(self.send_worker()))
             tasks.append(asyncio.create_task(self.ob.run_forever()))
         await asyncio.gather(*tasks)
 
