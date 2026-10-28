@@ -2,6 +2,7 @@
 """微信 ↔ AstrBot 连接器（OneBot v11）
 
 收：轮询本地数据库（wxdb），白名单里的人（私聊；写 "*" 就是所有好友）和白名单里的群发来的新文字 → OneBot 消息事件 → AstrBot
+    表情包：按消息里的 cdnurl 下载原图核对（md5、格式、大小），合格的以 image 段（文件名 + 原图地址，和 NapCat 一样）交给 AstrBot
     群里有人 @ 小号时，事件前面加一个 at 段，AstrBot 按「被 @」处理
     引用回复：事件前面加一个 reply 段，被引用的那条记在内存里，AstrBot 用 get_msg 来取；
     引用的是小号的话，AstrBot 当成在叫它（和 QQ 上回复机器人的消息一样）
@@ -35,7 +36,7 @@ import media  # noqa: E402
 import onebot  # noqa: E402
 import wxdb  # noqa: E402
 
-VERSION = "0.5.1"
+VERSION = "0.6.0"
 HERE = os.path.dirname(os.path.abspath(__file__))
 # 界面驱动的这些失败都发生在回车之前（回车前核对失败时已经清空输入框），一个字都没发出去，可以重试
 # 发图片后回查数据库确认用：PNG/JPG 存成图片 3，GIF 粘贴后存成动画表情附件 (49, 8)，有时是表情 47
@@ -61,6 +62,9 @@ DEFAULTS = {
     "media_dir": "/tmp/wechat-connector-media",
     "group_voice_min_seconds": 20,
     "voice_mode": "native",
+    "receive_stickers": True,   # 收别人发的表情包，当成图片交给 AstrBot
+    "group_stickers": True,     # 群里的表情包也收（陪伴类插件开着群聊看图时，每张会多一次看图调用）
+    "max_sticker_kb": 5120,     # 超过这么大的表情包不收
     "max_queue_wait": 150,  # 排队超过这么多秒还没轮到就不发了（AstrBot 等回执最多 180 秒，超时后插件可能已经改发文字）
 }
 
@@ -224,6 +228,7 @@ class Connector:
         self.sent_times: deque[float] = deque()
         self.at_pattern = None  # init_marks 里按小号昵称生成
         self.quoted: OrderedDict[int, dict] = OrderedDict()  # 被引用的消息，给 get_msg 用
+        self.stickers: OrderedDict[str, dict] = OrderedDict()  # md5 → 已核对过的 {file, url}，同一个表情包不重复下载
         self.media = media.MediaDir(cfg["media_dir"])
         self.face_names = {}
         if cfg.get("face_map"):
@@ -290,9 +295,17 @@ class Connector:
         if age > self.cfg["max_message_age"]:
             log.info("跳过 %s 的旧消息（%d 秒前）", cid, age)
             return
-        if m["type"] != 1 or not m["text"]:
+        image = None
+        if m["type"] == 47:
+            if not self.cfg["receive_stickers"] or (chat.endswith("@chatroom") and not self.cfg["group_stickers"]):
+                return
+            image = await self.sticker_image(m.get("sticker"))
+            if not image:
+                log.info("跳过 %s 的表情包（拿不到原图）", cid)
+                return
+        elif m["type"] != 1 or not m["text"]:
             if m["type"] != 10000:  # 10000 是「某某撤回了一条消息」这类系统提示
-                log.info("跳过 %s 的非文字消息 type=%s（只收文字和引用）", cid, m["type"])
+                log.info("跳过 %s 的非文字消息 type=%s（只收文字、引用和表情包）", cid, m["type"])
             return
         mid = onebot.stable_id(f"{chat}:{m['local_id']}:{m['time']}")
         quote = m.get("quote")
@@ -305,15 +318,45 @@ class Connector:
             at_self = bool(self.at_pattern and self.at_pattern.search(text))
             if at_self:
                 text = self.at_pattern.sub("", text, count=1).strip()
-            log.info("群 %s 里 %s 发了文字 %d 字%s%s", cid, uid, len(text), "，@ 了小号" if at_self else "", quote_note)
+            if image:
+                log.info("群 %s 里 %s 发了表情包", cid, uid)
+            else:
+                log.info("群 %s 里 %s 发了文字 %d 字%s%s", cid, uid, len(text), "，@ 了小号" if at_self else "", quote_note)
             event = onebot.group_message_event(self.self_id, cid, uid, self.store.display_name(sender), mid,
-                                               text, at_self, int(m["time"]), reply_id)
+                                               text, at_self, int(m["time"]), reply_id, image)
         else:
-            log.info("收到 %s 的私聊文字 %d 字%s", cid, len(m["text"]), quote_note)
+            if image:
+                log.info("收到 %s 的私聊表情包", cid)
+            else:
+                log.info("收到 %s 的私聊文字 %d 字%s", cid, len(m["text"]), quote_note)
             event = onebot.private_message_event(self.self_id, cid, self.store.display_name(chat), mid,
-                                                 m["text"], int(m["time"]), reply_id)
+                                                 m["text"], int(m["time"]), reply_id, image)
         if not self.cfg["receive_only"]:
             await self.ob.push(event)
+
+    async def sticker_image(self, sticker: dict | None) -> dict | None:
+        """表情包 → image 段要的 {file: 文件名, url: 原图地址}。先下载一次核对（能下、是图片、md5 对、不太大），
+        AstrBot 和插件再按 url 自己去取；最近 100 个按 md5 缓存。不合格返回 None"""
+        if not sticker:
+            return None
+        cached = self.stickers.get(sticker["md5"]) if sticker["md5"] else None
+        if cached:
+            self.stickers.move_to_end(sticker["md5"])
+            return cached
+        try:
+            data = await asyncio.to_thread(media.fetch_sticker, sticker["url"], sticker["md5"],
+                                           self.cfg["max_sticker_kb"] * 1024)
+        except Exception as e:
+            log.info("表情包下载失败（%s）", type(e).__name__)
+            return None
+        if not data:
+            return None
+        image = {"file": f"{sticker['md5'] or 'sticker'}.{media.image_ext(data)}", "url": sticker["url"]}
+        if sticker["md5"]:
+            self.stickers[sticker["md5"]] = image
+            while len(self.stickers) > 100:
+                self.stickers.popitem(last=False)
+        return image
 
     def remember_quote(self, chat: str, quote: dict) -> int:
         """把被引用的那条做成一条消息记下来（最多 200 条），返回它的消息 ID；

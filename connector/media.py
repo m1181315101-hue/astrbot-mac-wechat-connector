@@ -6,6 +6,7 @@ AstrBot 的 aiocqhttp 适配器把 Image / Record 都转成 base64://… 放进�
 临时文件放在 media_dir 下各自的子目录里，超过 10 分钟的自动清掉。
 """
 import base64
+import hashlib
 import io
 import os
 import shutil
@@ -32,6 +33,17 @@ def load_data(file_val: str) -> bytes | None:
         with open(path, "rb") as f:
             return f.read()
     return None
+
+
+def fetch_sticker(url: str, md5: str, max_bytes: int) -> bytes | None:
+    """表情包原图：按消息里的 cdnurl 下载，超过 max_bytes、md5 对不上或者认不出是图片就返回 None"""
+    with urllib.request.urlopen(url, timeout=15) as r:
+        data = r.read(max_bytes + 1)
+    if len(data) > max_bytes or not image_ext(data):
+        return None
+    if md5 and hashlib.md5(data).hexdigest() != md5:
+        return None
+    return data
 
 
 def image_ext(data: bytes) -> str:

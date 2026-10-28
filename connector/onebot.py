@@ -107,25 +107,36 @@ def _reply_seg(reply_id: int | None) -> tuple[list[dict], str]:
     return [{"type": "reply", "data": {"id": str(reply_id)}}], f"[CQ:reply,id={reply_id}]"
 
 
+def _image_seg(image: dict | None) -> tuple[list[dict], str]:
+    """收到的表情包：放一个 image 段，格式和 NapCat 一样（file 是文件名，url 是下载地址）。
+    不用 base64://：AstrBot 本身认，但有的插件（比如陪伴插件的群聊看图）只会按 file 读本地文件、读不到再用 url"""
+    if not image:
+        return [], ""
+    return [{"type": "image", "data": {"file": image["file"], "url": image["url"]}}], "[图片]"
+
+
 def private_message_event(self_id: int, user_id: int, nickname: str, message_id: int, text: str, ts: int,
-                          reply_id: int | None = None) -> dict:
+                          reply_id: int | None = None, image: dict | None = None) -> dict:
     reply, raw = _reply_seg(reply_id)
+    img, img_raw = _image_seg(image)
     return {
         "time": ts, "self_id": self_id, "post_type": "message", "message_type": "private", "sub_type": "friend",
         "message_id": message_id, "user_id": user_id, "font": 0,
-        "message": reply + [{"type": "text", "data": {"text": text}}], "raw_message": raw + text,
-        "message_format": "array",
+        "message": reply + img + ([{"type": "text", "data": {"text": text}}] if text else []),
+        "raw_message": raw + img_raw + text, "message_format": "array",
         "sender": {"user_id": user_id, "nickname": nickname, "sex": "unknown", "age": 0},
     }
 
 
 def group_message_event(self_id: int, group_id: int, user_id: int, nickname: str, message_id: int,
-                        text: str, at_self: bool, ts: int, reply_id: int | None = None) -> dict:
+                        text: str, at_self: bool, ts: int, reply_id: int | None = None,
+                        image: dict | None = None) -> dict:
     """at_self：微信里有人 @ 了小号，就在前面放一个 at 段，AstrBot 按「被 @」处理"""
     reply, raw = _reply_seg(reply_id)
-    message = reply + ([{"type": "at", "data": {"qq": str(self_id)}}] if at_self else []) + \
+    img, img_raw = _image_seg(image)
+    message = reply + ([{"type": "at", "data": {"qq": str(self_id)}}] if at_self else []) + img + \
         ([{"type": "text", "data": {"text": text}}] if text else [])  # 只 @ 不说话时正文为空
-    raw += (f"[CQ:at,qq={self_id}] " if at_self else "") + text
+    raw += (f"[CQ:at,qq={self_id}] " if at_self else "") + img_raw + text
     return {
         "time": ts, "self_id": self_id, "post_type": "message", "message_type": "group", "sub_type": "normal",
         "message_id": message_id, "group_id": group_id, "user_id": user_id, "font": 0, "anonymous": None,

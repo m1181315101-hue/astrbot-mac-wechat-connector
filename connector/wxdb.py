@@ -288,6 +288,21 @@ def parse_quote(xml_text: str) -> dict | None:
             "time": int((ref.findtext("createtime") or "0").strip() or 0), "text": quoted}
 
 
+def parse_sticker(xml_text: str) -> dict | None:
+    """表情包（local_type 47）：emoji 的 cdnurl 是能直接下载的原图（md5 和消息里的一致），
+    微信商店表情、自定义表情都一样。拿不到地址返回 None"""
+    try:
+        emoji = ET.fromstring(xml_text.strip()).find("emoji")
+    except ET.ParseError:
+        return None
+    if emoji is None:
+        return None
+    url = (emoji.get("cdnurl") or "").replace("&amp;", "&").strip()
+    if not url.startswith(("http://", "https://")):
+        return None
+    return {"url": url, "md5": (emoji.get("md5") or "").strip().lower()}
+
+
 SYSTEM_IDS = {"filehelper", "weixin", "fmessage", "medianote", "floatbottle", "newsapp",
               "notifymessage", "brandsessionholder", "qqmail", "tmessage", "qmessage"}
 
@@ -375,6 +390,7 @@ class WeChatStore:
     def new_messages(self, wxid: str, marks: dict[str, int]) -> list[dict]:
         """marks：{库文件名: 已处理到的 local_id}，原地更新；返回对方发来的新消息（含非文字，type 区分）。
         引用回复当成文字（type 1，text 是新说的话），另带 quote：被引用的那条（见 parse_quote）。
+        表情包（type 47）另带 sticker：下载地址和 md5（见 parse_sticker）。
         调用方启动时先用 latest_ids 把已有会话的水位设到最新（不回放历史）；
         之后才出现的会话表（第一次聊天、新分库）不在 marks 里，从头读。"""
         table, out = self.table_of(wxid), []
@@ -392,7 +408,7 @@ class WeChatStore:
                     continue
                 base_type, sub_type = local_type & 0xFFFFFFFF, local_type >> 32  # 高 32 位是子类型（链接、文件等）
                 is_quote = base_type == 49 and sub_type == 57
-                text, quote = (decode_content(content) if base_type == 1 or is_quote else ""), None
+                text, quote, sticker = (decode_content(content) if base_type in (1, 47) or is_quote else ""), None, None
                 if wxid.endswith("@chatroom"):  # 群里别人发的文字、引用带「发送者wxid:换行」前缀
                     text = GROUP_PREFIX.sub("", text, count=1)
                 if is_quote:
@@ -401,8 +417,10 @@ class WeChatStore:
                         text = ""
                     else:
                         base_type, text = 1, quote.pop("title")
+                elif base_type == 47:
+                    sticker, text = parse_sticker(text), ""
                 out.append({"local_id": local_id, "server_id": server_id, "type": base_type, "time": create_time,
-                            "sender": names.get(sender, ""), "text": text, "quote": quote})
+                            "sender": names.get(sender, ""), "text": text, "quote": quote, "sticker": sticker})
         return out
 
     def self_count(self, wxid: str, since: int, types: tuple) -> int:
