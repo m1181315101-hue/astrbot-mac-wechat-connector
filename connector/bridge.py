@@ -4,7 +4,7 @@
 收：轮询本地数据库（wxdb），白名单里的人（私聊）和白名单里的群发来的新文字 → OneBot 消息事件 → AstrBot
     群里有人 @ 小号时，事件前面加一个 at 段，AstrBot 按「被 @」处理
 回：AstrBot 的 send_private_msg / send_group_msg → 发送队列 → 界面驱动（wxui）切换会话、核对、粘贴、回车
-    → 回查数据库确认。文字、图片（GIF 是动画表情）、语音（mp3 文件）按原顺序一段一段发
+    → 回查数据库确认。文字、图片（GIF 是动画表情）、语音（原生语音条，不行就退回 mp3 文件）按原顺序一段一段发
 
 用法（在微信容器里，用和微信相同的用户运行）：
   python3 bridge.py run    [--config /config/wechat-connector/config.json]
@@ -31,7 +31,7 @@ import media  # noqa: E402
 import onebot  # noqa: E402
 import wxdb  # noqa: E402
 
-VERSION = "0.2.0"
+VERSION = "0.3.0"
 HERE = os.path.dirname(os.path.abspath(__file__))
 log = logging.getLogger("wechat-connector")
 
@@ -52,6 +52,7 @@ DEFAULTS = {
     "face_map": "",
     "media_dir": "/tmp/wechat-connector-media",
     "group_voice_min_seconds": 20,
+    "voice_mode": "native",
 }
 
 
@@ -76,8 +77,11 @@ def setup_logging(state_dir: str) -> None:
     log.setLevel(logging.INFO)
 
 
+WECHAT_ENV_KEYS = (b"DISPLAY", b"DBUS_SESSION_BUS_ADDRESS", b"PULSE_SERVER", b"PULSE_RUNTIME_PATH", b"XDG_RUNTIME_DIR")
+
+
 def wechat_env() -> dict:
-    """界面驱动要和微信用同一个 X 显示和会话总线：从微信主进程的环境变量里读"""
+    """界面驱动要和微信用同一个 X 显示、会话总线和声音服务：从微信主进程的环境变量里读"""
     env = {}
     for d in os.listdir("/proc"):
         if not d.isdigit():
@@ -89,8 +93,8 @@ def wechat_env() -> dict:
                 pairs = [p.split(b"=", 1) for p in f.read().split(b"\0") if b"=" in p]
         except OSError:
             continue
-        found = {k.decode(): v.decode() for k, v in pairs if k in (b"DISPLAY", b"DBUS_SESSION_BUS_ADDRESS")}
-        if len(found) == 2:
+        found = {k.decode(): v.decode() for k, v in pairs if k in WECHAT_ENV_KEYS}
+        if b"DISPLAY" in dict(pairs) and b"DBUS_SESSION_BUS_ADDRESS" in dict(pairs):
             return found
         env.update(found)
     return env
@@ -369,11 +373,23 @@ class Connector:
                 if kind == "text":
                     ok, why = await self._send_one(label, wxid, name, sections, use_list, text=value)
                 else:
-                    path, why = await asyncio.to_thread(self._prepare_media, kind, value, group)
+                    items, why, data = await asyncio.to_thread(self._prepare_media, kind, value, group)
                     ok = False
-                    if path:
-                        ok, why = await self._send_one(label, wxid, name, sections, use_list, file=path,
-                                                       types=(3, 47) if kind == "image" else (49, 34))
+                    for i, (how, path, secs) in enumerate(items):
+                        if how == "voice":
+                            ok, why = await self._send_one(label, wxid, name, sections, use_list, voice=path,
+                                                           seconds=secs, types=(34,))
+                            if not ok and i == 0:  # 第一段就没发出去：整段退回成音频文件
+                                log.warning("语音条没发出去（%s），改发音频文件", why)
+                                fallback, why, _ = await asyncio.to_thread(self._voice_as_file, data,
+                                                                           sum(x[2] for x in items))
+                                for _how, fpath, _secs in fallback:
+                                    ok, why = await self._send_one(label, wxid, name, sections, use_list,
+                                                                   file=fpath, types=(49,))
+                                break
+                        else:
+                            ok, why = await self._send_one(label, wxid, name, sections, use_list, file=path,
+                                                           types=(3, 47) if kind == "image" else (49,))
                 if ok:
                     sent += 1
                 else:
@@ -382,26 +398,35 @@ class Connector:
             return "ok", 0, {"message_id": onebot.stable_id(f"out:{time.time_ns()}")}
         return "failed", 1500, {"message": "；".join(reasons) or "发送失败"}
 
-    def _prepare_media(self, kind: str, value: str, group: bool) -> tuple[str | None, str]:
+    def _prepare_media(self, kind: str, value: str, group: bool) -> tuple[list[tuple[str, str, float]], str, bytes]:
+        """返回 ([(file|voice, 路径, 秒数)], 失败原因, 原始数据)"""
         try:
             data = media.load_data(value)
         except Exception as e:
-            return None, f"取不到{'图片' if kind == 'image' else '语音'}数据（{type(e).__name__}）"
+            return [], f"取不到{'图片' if kind == 'image' else '语音'}数据（{type(e).__name__}）", b""
         if not data:
-            return None, "取不到媒体数据（可能是只在 AstrBot 容器里的文件路径）"
+            return [], "取不到媒体数据（可能是只在 AstrBot 容器里的文件路径）", b""
         if kind == "image":
             path = self.media.image_file(data)
-            return (path, "") if path else (None, "不认识的图片格式")
+            return ([("file", path, 0.0)], "", data) if path else ([], "不认识的图片格式", data)
         seconds = media.audio_seconds(data)
         min_seconds = self.cfg["group_voice_min_seconds"]
         if group and (min_seconds < 0 or seconds < min_seconds):
             log.info("群里不发 %.0f 秒的短语音（group_voice_min_seconds=%s）", seconds, min_seconds)
-            return None, "群里不发短语音，请改用文字回复"
+            return [], "群里不发短语音，请改用文字回复", data
+        if self.cfg["voice_mode"] == "native":
+            segments = self.media.voice_segments(data)
+            if segments:
+                return [("voice", path, secs) for path, secs in segments], "", data
+        return self._voice_as_file(data, seconds)
+
+    def _voice_as_file(self, data: bytes, seconds: float) -> tuple[list[tuple[str, str, float]], str, bytes]:
         path = self.media.voice_file(data, "翻唱.mp3" if seconds >= 20 else "语音.mp3")
-        return (path, "") if path else (None, "不认识的音频格式")
+        return ([("file", path, seconds)], "", data) if path else ([], "不认识的音频格式", data)
 
     async def _send_one(self, label: str, wxid: str, name: str, sections: list[str], use_list: bool,
-                        text: str = "", file: str = "", types: tuple[int, ...] = ()) -> tuple[bool, str]:
+                        text: str = "", file: str = "", voice: str = "", seconds: float = 0.0,
+                        types: tuple[int, ...] = ()) -> tuple[bool, str]:
         await self._rate_limit()
         since = int(time.time()) - 2
         if text:
@@ -412,9 +437,10 @@ class Connector:
             async with self.db_lock:
                 await asyncio.to_thread(self.store.refresh)
                 before = await asyncio.to_thread(self.store.self_count, wxid, since, types)
-            req = {"op": "send", "name": name, "file": file, "sections": sections, "use_list": use_list, "delay": 0.3}
-        resp = await asyncio.to_thread(self.ui.request, req)
-        what = f"{len(text)} 字" if text else os.path.basename(file)
+            req = {"op": "send", "name": name, "sections": sections, "use_list": use_list, "delay": 0.3}
+            req.update({"voice": voice, "seconds": seconds} if voice else {"file": file})
+        resp = await asyncio.to_thread(self.ui.request, req, 40.0 + seconds)
+        what = f"{len(text)} 字" if text else (f"语音条 {seconds:.0f} 秒" if voice else os.path.basename(file))
         if not resp.get("ok"):
             log.warning("发给 %s 失败（%s）：%s", label, what, resp.get("reason"))
             return False, f"发送失败：{resp.get('reason')}"

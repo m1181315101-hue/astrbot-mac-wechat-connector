@@ -8,5 +8,6 @@
   "face_map": "/config/wechat-connector/face_map.json",
   "max_sends_per_minute": 20,
   "max_message_age": 600,
-  "group_voice_min_seconds": 20
+  "group_voice_min_seconds": 20,
+  "voice_mode": "native"
 }

@@ -9,7 +9,7 @@
 
 > **当前能做的**：
 > - **收**：只收文字。私聊只放行白名单里的人；群聊只放行白名单里的群，群里有人 @ 小号时才会触发回复。
-> - **发**：文字、图片、表情包（GIF 会变成微信的动画表情）、语音（以 mp3 音频文件发出）。AstrBot 的插件和 MCP 工具都照常可用，它们发出的图片、语音会被原样转发。
+> - **发**：文字、图片、表情包（GIF 会变成微信的动画表情）、**原生语音条**（用微信自带的「发语音」录一段虚拟麦克风里的声音；录不了时退回成 mp3 音频文件）。AstrBot 的插件和 MCP 工具都照常可用，它们发出的图片、语音会被原样转发。
 > - 还不能收别人发的图片和语音，正在做。
 
 ## ⚠️ 先看风险
@@ -39,9 +39,9 @@
 |---|---|
 | `connector/wxkey.py` | 扫码登录时用 GDB 断点抓数据库密钥原料（passphrase），校验后存进 `keys.json` |
 | `connector/wxdb.py` | 解密数据库（SQLCipher 4）：主库加 WAL 增量叠加，用 `sqlite3.deserialize` 在内存里打开，读新消息和通讯录 |
-| `connector/wxui.py` | 界面驱动：通过无障碍接口（AT-SPI）读微信界面，按名字找会话，用 xdotool 点击和粘贴 |
+| `connector/wxui.py` | 界面驱动：通过无障碍接口（AT-SPI）读微信界面，按名字找会话，用 xdotool 点击和粘贴；发语音条时点「发语音」、把音频播进虚拟麦克风、再点「发送语音」 |
 | `connector/onebot.py` | OneBot v11 反向 WebSocket 客户端，以及消息事件的格式 |
-| `connector/media.py` | 把 AstrBot 发来的图片、语音（base64）落成临时文件：WEBP 转 PNG，wav 用 lame 转 mp3，估算音频时长 |
+| `connector/media.py` | 把 AstrBot 发来的图片、语音（base64）落成临时文件：WEBP 转 PNG；语音条用 wav（mp3 用 lame 解码，超过 55 秒切段），退回文件时用 lame 转 mp3；估算音频时长 |
 | `connector/bridge.py` | 主程序：轮询、白名单、发送队列、限速、确认 |
 
 ## 环境要求
@@ -95,6 +95,11 @@ docker exec -u 0 wechat chown -R abc:users /config/wechat-connector
 
 > 这些是装在容器里的，容器删掉重建就没了，要重新装。
 
+**语音条还要两个条件**（缺了也能用，只是语音会退回成 mp3 文件）：
+
+1. **微信要能连上声音服务**：这个镜像给微信的环境里只有 `PULSE_RUNTIME_PATH=/defaults`，而 PulseAudio 要求这个目录归自己所有，微信就连不上，一点「发语音」就提示「未检测到麦克风设备」。要让微信带着 `PULSE_SERVER=unix:/defaults/native` 启动。
+2. **微信启动前要有虚拟麦克风**：微信只在启动时找麦克风，而且不把 PulseAudio 的「监听源」当麦克风。连接器的界面驱动启动时会自动建一个（null sink `wxvmic_sink` 加 remap source `wxvmic`，设成默认输入），建好以后要**重启一次微信**。网页桌面原来的推流会留在原设备上，不受影响。
+
 ### 3. 扫码登录，同时抓密钥
 
 **先挂断点，再扫码。** 新版微信只在登录那一刻派生数据库密钥。
@@ -133,8 +138,9 @@ docker exec -u abc wechat /lsiopy/bin/python3 /config/wechat-connector/connector
 | `face_map` | 可选，指向 QQ 表情插件的 `face_map.json`。AstrBot 回复里的 QQ 表情会翻回 `[旺柴]` 这种文字，微信会显示成表情 |
 | `max_sends_per_minute` | 每分钟最多发几条，默认 20，多出来的排队 |
 | `max_message_age` | 超过这么多秒的旧消息不转发，默认 600。连接器停了一段时间再启动时，不会回一堆过期消息 |
-| `group_voice_min_seconds` | 群里只发不短于这么多秒的语音，默认 20：点歌（翻唱）会发，随口的短语音不发，免得群里全是音频文件。设成 0 群里所有语音都发，设成 -1 群里一律不发。私聊不受影响。不发时会告诉 AstrBot「发送失败」，插件会改用文字回复 |
+| `group_voice_min_seconds` | 群里只发不短于这么多秒的语音，默认 20：点歌（翻唱）会发，随口的短语音不发，免得群里语音太多。设成 0 群里所有语音都发，设成 -1 群里一律不发。私聊不受影响。不发时会告诉 AstrBot「发送失败」，插件会改用文字回复 |
 | `media_dir` | 待发图片、语音的临时目录，默认 `/tmp/wechat-connector-media`，超过 10 分钟的自动清掉 |
+| `voice_mode` | `native`（默认）发原生语音条，失败时退回 mp3 文件；`file` 一律发 mp3 文件 |
 
 ### 5. AstrBot 里加一个平台
 
@@ -179,7 +185,7 @@ docker exec -d -u abc wechat sh -c 'cd /config/wechat-connector && exec /lsiopy/
 ## 已知限制
 
 - **收**：只收文字。别人发的图片、语音、表情包会被跳过（日志里记一行类型）。
-- **语音是音频文件**：电脑版微信本来就发不了「按住说话」的语音条，所以语音以 mp3 文件发出，对方点开播放。
+- **语音条按实际时长录**：一段 20 秒的语音要录 20 秒，这期间界面被占着，后面的消息排队。超过 55 秒的切成几条（微信语音条最长 60 秒）。
 - **视频、文件**：AstrBot 发视频、文件时给的是它自己容器里的路径，连接器拿不到，会跳过。
 - **回复会慢几秒**：会话已经开着时大约 1 秒；要切换会话时 2～6 秒，再加上打字停顿。
 - **同名的联系人或群会被跳过**：给它们设不同的备注名就行。

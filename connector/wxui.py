@@ -8,9 +8,14 @@ Linux 微信是 Qt 写的，带无障碍桥：打开 org.a11y.Status.IsEnabled �
   {"op": "ping"}
   {"op": "send", "name": "备注名", "text": "...", "sections": ["联系人"], "use_list": true, "delay": 1.2}
   {"op": "send", "name": "备注名", "file": "/tmp/xx/语音.mp3", "sections": ["群聊"], "use_list": true}
-  → {"ok": true, "path": "list|search|already"} / {"ok": false, "reason": "..."}
+  {"op": "send", "name": "备注名", "voice": "/tmp/xx/voice.wav", "sections": ["联系人"], "use_list": true}
+  → {"ok": true, "path": "list|search|already"} / {"ok": false, "reason": "...", "recording": false}
 
 发文件是用 text/uri-list 粘贴：GIF 会变成动画表情，PNG/JPG 变成图片，其他（比如 mp3）变成文件。
+发语音条用微信自带的「发语音」：点它开始录音 → 把音频播进虚拟麦克风 → 点「发送语音」。
+虚拟麦克风 = PulseAudio 的 null sink（wxvmic_sink）+ 把它的监听源包装成普通输入设备（wxvmic）；
+微信不把「监听源」当麦克风，而且只在启动时找麦克风，所以要在微信启动前建好、设成默认输入，
+微信的环境里还要有 PULSE_SERVER（只有 PULSE_RUNTIME_PATH 时它连不上声音服务）。
 
 安全规则：
 - 会话列表只在 use_list=true（调用方确认这个名字在通讯录里独一无二）时用，按第一行精确匹配；
@@ -20,6 +25,7 @@ Linux 微信是 Qt 写的，带无障碍桥：打开 org.a11y.Status.IsEnabled �
 """
 import json
 import os
+import re
 import subprocess
 import sys
 import time
@@ -46,6 +52,45 @@ def set_clipboard(data: bytes, mime: str | None = None) -> None:
     # xclip 会留在后台占着剪贴板，输出不能接管道，否则会一直等它退出
     cmd = ["xclip", "-selection", "clipboard"] + (["-t", mime] if mime else [])
     subprocess.run(cmd, input=data, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, check=False)
+
+
+VMIC_SINK, VMIC_SOURCE = "wxvmic_sink", "wxvmic"
+
+
+def pactl_json(*args: str):
+    out = subprocess.run(["pactl", "-f", "json", *args], capture_output=True, text=True, check=False).stdout
+    try:
+        return json.loads(out) if out.strip() else []
+    except ValueError:
+        return []
+
+
+def ensure_virtual_mic() -> bool:
+    """没有就建虚拟麦克风并设成默认输入；原来跟着默认输入走的其他录音（比如网页桌面的推流）挪回原设备"""
+    sources = [x.get("name") for x in pactl_json("list", "short", "sources")]
+    if VMIC_SOURCE not in sources:
+        subprocess.run(["pactl", "load-module", "module-null-sink", f"sink_name={VMIC_SINK}",
+                        "sink_properties=device.description=WxVirtualMicSink"], capture_output=True, check=False)
+        subprocess.run(["pactl", "load-module", "module-remap-source", f"master={VMIC_SINK}.monitor",
+                        f"source_name={VMIC_SOURCE}", "source_properties=device.description=WxVirtualMic"],
+                       capture_output=True, check=False)
+    info = pactl_json("info")
+    previous = info.get("default_source_name", "") if isinstance(info, dict) else ""
+    if previous != VMIC_SOURCE:
+        subprocess.run(["pactl", "set-default-source", VMIC_SOURCE], capture_output=True, check=False)
+        vmic_index = next((x.get("index") for x in pactl_json("list", "short", "sources")
+                           if x.get("name") == VMIC_SOURCE), None)
+        for out in pactl_json("list", "source-outputs"):
+            binary = (out.get("properties") or {}).get("application.process.binary", "")
+            if out.get("source") == vmic_index and binary != "wechat" and previous:
+                subprocess.run(["pactl", "move-source-output", str(out.get("index")), previous],
+                               capture_output=True, check=False)
+    return VMIC_SOURCE in [x.get("name") for x in pactl_json("list", "short", "sources")]
+
+
+def wechat_recording() -> bool:
+    return any((x.get("properties") or {}).get("application.process.binary") == "wechat"
+               for x in pactl_json("list", "source-outputs"))
 
 
 def enable_a11y() -> bool:
@@ -132,14 +177,18 @@ def click(node) -> None:
     sh("xdotool", "mousemove", str(int((x + w / 2) * s)), str(int((y + h / 2) * s)), "click", "1")
 
 
+# 微信连上麦克风以后，输入框名字后面会多一句提示：「会话名 按住 Ctrl + Super 使用语音输入文字」
+VOICE_INPUT_HINT = re.compile(r"\s+按住\s*Ctrl\s*\+\s*Super\s*使用语音输入文字$")
+
+
 def current_chat() -> str:
-    """底部输入框（大文本框）的无障碍名字就是当前会话名"""
+    """底部输入框（大文本框）的无障碍名字就是当前会话名（去掉语音输入提示）"""
     frame = main_frame()
     for node in walk(frame):
         if role(node) == "text":
             _x, _y, w, h = ext(node)
             if w > 200 and h > 40:
-                return node.get_name() or ""
+                return VOICE_INPUT_HINT.sub("", node.get_name() or "")
     return ""
 
 
@@ -226,13 +275,60 @@ def open_chat(target: str, sections: set[str], use_list: bool) -> tuple[bool, st
     return False, why or "打开后输入框名字对不上"
 
 
+def button(name: str, near=None):
+    """按无障碍名字找按钮；near 给了就只要和它同一行（y 相差 12 以内）的"""
+    for node in walk(main_frame()):
+        if role(node) == "push button" and node.get_name() == name:
+            if near is None or abs(ext(node)[1] - ext(near)[1]) <= 12:
+                return node
+    return None
+
+
+def cancel_recording() -> None:
+    send = button("发送语音")
+    cancel = button("取消", near=send) if send is not None else None
+    if cancel is not None:
+        click(cancel)
+    else:
+        sh("xdotool", "key", "--clearmodifiers", "Escape")
+    time.sleep(0.5)
+
+
+def send_voice(target: str, path: str, seconds: float, how: str) -> dict:
+    start = button("发语音")
+    if start is None:
+        return {"ok": False, "reason": "没找到「发语音」按钮", "recording": False}
+    click(start)
+    deadline = time.time() + 3.0
+    while time.time() < deadline and not (wechat_recording() and button("发送语音") is not None):
+        time.sleep(0.2)
+    if not wechat_recording() or button("发送语音") is None:
+        sh("xdotool", "key", "--clearmodifiers", "Escape")
+        return {"ok": False, "reason": "微信没有开始录音（检查虚拟麦克风和微信的 PULSE_SERVER）", "recording": False}
+    if current_chat() != target:
+        cancel_recording()
+        return {"ok": False, "reason": "开始录音后会话对不上，已取消", "recording": True}
+    played = subprocess.run(["paplay", f"--device={VMIC_SINK}", path], capture_output=True,
+                            timeout=seconds + 15, check=False)
+    time.sleep(0.4)
+    send = button("发送语音")
+    if played.returncode != 0 or send is None or current_chat() != target:
+        cancel_recording()
+        return {"ok": False, "reason": "播放失败或发送前核对失败，已取消录音", "recording": True}
+    click(send)
+    time.sleep(0.8)
+    log(f"已发送：名字 {len(target)} 字，语音条 {seconds:.0f} 秒，路径 {how}")
+    return {"ok": True, "path": how}
+
+
 def handle_send(req: dict) -> dict:
     target = req["name"]
-    text, path = req.get("text", ""), req.get("file", "")
-    if not target or not (text or path):
+    text, path, voice = req.get("text", ""), req.get("file", ""), req.get("voice", "")
+    if not target or not (text or path or voice):
         return {"ok": False, "reason": "名字或内容为空"}
-    if path and not os.path.isfile(path):
-        return {"ok": False, "reason": "要发的文件不存在"}
+    for f in (path, voice):
+        if f and not os.path.isfile(f):
+            return {"ok": False, "reason": "要发的文件不存在"}
     if main_frame() is None:
         return {"ok": False, "reason": "无障碍树里没有微信主窗口"}
     wid = sh("xdotool", "search", "--onlyvisible", "--name", "^微信$").split()
@@ -241,6 +337,8 @@ def handle_send(req: dict) -> dict:
     ok, how = open_chat(target, set(req.get("sections") or ["联系人"]), bool(req.get("use_list")))
     if not ok:
         return {"ok": False, "reason": how}
+    if voice:
+        return send_voice(target, voice, float(req.get("seconds") or 0), how)
     time.sleep(max(0.0, float(req.get("delay", 0))))  # 像人在打字
     if path:
         set_clipboard(f"file://{urllib.parse.quote(path)}\r\n".encode(), "text/uri-list")
@@ -261,6 +359,8 @@ def handle_send(req: dict) -> dict:
 def main() -> None:
     if not enable_a11y():
         log("打开无障碍开关失败（会话总线地址不对？）")
+    if os.environ.get("PULSE_SERVER") and not ensure_virtual_mic():
+        log("虚拟麦克风没建起来，语音条会退回成音频文件")
     time.sleep(1.0)
     for line in sys.stdin:
         try:

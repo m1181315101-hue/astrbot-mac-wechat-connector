@@ -116,6 +116,45 @@ class MediaDir:
             f.write(data)
         return path
 
+    def voice_segments(self, data: bytes, max_seconds: float = 55.0) -> list[tuple[str, float]]:
+        """语音条用：转成 wav（mp3 用 lame 解码），超过 max_seconds 的切成几段（微信语音条最长 60 秒）。
+        返回 [(wav 路径, 秒数)]；不认识的格式返回空列表"""
+        import wave
+        kind = audio_kind(data)
+        if not kind:
+            return []
+        d = self._new_dir()
+        src = os.path.join(d, "in.wav")
+        if kind == "mp3":
+            mp3 = os.path.join(d, "in.mp3")
+            with open(mp3, "wb") as f:
+                f.write(data)
+            r = subprocess.run(["lame", "--quiet", "--decode", mp3, src], capture_output=True, timeout=60)
+            os.remove(mp3)
+            if r.returncode != 0:
+                return []
+        else:
+            with open(src, "wb") as f:
+                f.write(data)
+        try:
+            with wave.open(src) as w:
+                params, rate, total = w.getparams(), w.getframerate(), w.getnframes()
+                if total / rate <= max_seconds:
+                    return [(src, total / rate)]
+                parts, n, per = [], 0, int(max_seconds * rate)
+                while n < total:
+                    frames = w.readframes(min(per, total - n))
+                    out = os.path.join(d, f"part{len(parts) + 1}.wav")
+                    with wave.open(out, "wb") as o:
+                        o.setparams(params)
+                        o.writeframes(frames)
+                    parts.append((out, min(per, total - n) / rate))
+                    n += per
+            os.remove(src)
+            return parts
+        except (wave.Error, EOFError):
+            return []
+
     def voice_file(self, data: bytes, name: str) -> str | None:
         kind = audio_kind(data)
         if not kind:

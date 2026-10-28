@@ -65,56 +65,73 @@ def load_sections(path: str) -> tuple[int, dict]:
     return e_type, secs
 
 
-def adrp_add_refs(text_addr: int, text: bytes) -> dict[int, list[tuple[int, int]]]:
-    """ADRP + ADD 组合算出的地址 → [(指令偏移, 目标寄存器)]"""
-    refs: dict[int, list[tuple[int, int]]] = {}
-    pending: dict[int, tuple[int, int]] = {}
-    words = struct.unpack_from(f"<{len(text) // 4}I", text)
+def adrp_refs(text_addr: int, text: bytes) -> tuple[dict, dict]:
+    """扫 .text 里的 ADRP + ADD（直接取地址）和 ADRP + LDR（经 GOT 取地址）组合，
+    返回 ({目标地址: [(指令偏移, 寄存器)]}, {GOT 槽地址: [(指令偏移, 寄存器)]})"""
+    adds: dict[int, list[tuple[int, int]]] = {}
+    gots: dict[int, list[tuple[int, int]]] = {}
+    pending: dict[int, tuple[int, int]] = {}  # reg -> (page, 指令序号)
+    n = len(text) // 4
+    words = struct.unpack_from(f"<{n}I", text)
     for i, w in enumerate(words):
         if (w & 0x9F000000) == 0x90000000:  # ADRP
             imm = (((w >> 5) & 0x7FFFF) << 2) | ((w >> 29) & 3)
             if imm & (1 << 20):
                 imm -= 1 << 21
-            pending[w & 0x1F] = (((text_addr + i * 4) & ~0xFFF) + (imm << 12), i)
-        elif (w & 0xFF800000) == 0x91000000:  # ADD Xd, Xn, #imm
-            hit = pending.get((w >> 5) & 0x1F)
-            if hit and i - hit[1] <= 8:
-                imm = (w >> 10) & 0xFFF
-                if (w >> 22) & 1:
-                    imm <<= 12
-                refs.setdefault(hit[0] + imm, []).append((i * 4, w & 0x1F))
-    return refs
+            pc = text_addr + i * 4
+            pending[w & 0x1F] = ((pc & ~0xFFF) + (imm << 12), i)
+            continue
+        rd, rn = w & 0x1F, (w >> 5) & 0x1F
+        hit = pending.get(rn)
+        if not hit or i - hit[1] > 8:
+            continue
+        if (w & 0xFF800000) == 0x91000000:  # ADD Xd, Xn, #imm
+            imm = (w >> 10) & 0xFFF
+            if (w >> 22) & 1:
+                imm <<= 12
+            adds.setdefault(hit[0] + imm, []).append((i * 4, rd))
+        elif (w & 0xFFC00000) == 0xF9400000:  # LDR Xt, [Xn, #imm]
+            gots.setdefault(hit[0] + ((w >> 10) & 0xFFF) * 8, []).append((i * 4, rd))
+    return adds, gots
 
 
 def func_start(text: bytes, off: int) -> int | None:
-    ret, nop = 0xD65F03C0, 0xD503201F
-    for p in range(off, max(0, off - 0x2000), -4):
-        w = struct.unpack_from("<I", text, p)[0]
-        if w in (0xD503233F, 0xD503245F):  # paciasp / bti c
-            return p
-        prev = struct.unpack_from("<I", text, p - 4)[0] if p >= 4 else ret
-        if prev in (ret, nop, 0) and w not in (nop, 0):
+    """从 off 往回找函数入口：开栈指令（sub sp / stp x29,x30 / paciasp / bti c），
+    并且前一条是上一个函数的结尾（ret、b、br、nop 填充）"""
+    def word(p):
+        return struct.unpack_from("<I", text, p)[0] if p >= 0 else 0xD65F03C0
+
+    def is_prologue(w):
+        return (w in (0xD503233F, 0xD503245F)
+                or (w & 0xFF8003FF) == 0xD10003FF      # sub sp, sp, #imm
+                or (w & 0xFFC07FFF) == 0xA9807BFD)     # stp x29, x30, [sp, #-n]!
+
+    def is_end(w):
+        return (w in (0xD65F03C0, 0xD503201F, 0)       # ret / nop / 填充
+                or (w & 0xFC000000) == 0x14000000      # b
+                or (w & 0xFFFFFC1F) == 0xD61F0000)     # br xN
+
+    for p in range(off, max(0, off - 0x4000), -4):
+        if is_prologue(word(p)) and is_end(word(p - 4)):
             return p
     return None
 
 
 def find_hooks(binary: str) -> tuple[int, list[int]]:
-    """x86 版找的是「LEA RDI,[unk]; LEA RSI,[anchor]」，arm64 对应 x0=unk、x1=anchor；
-    再找把 unk 放进 x1 的函数，断在它入口"""
+    """找 WCDB 设置数据库密码的函数入口。
+    x86 版：LEA RDI,[全局名字对象] + LEA RSI,[字符串] 初始化，再找 LEA RSI,[全局名字对象] 所在的函数。
+    arm64：x0=字符串、x8（经 GOT）=全局名字对象做初始化；再找把这个 GOT 槽读进 x1 的函数，断在它入口"""
     e_type, secs = load_sections(binary)
     ro_addr, ro = secs[".rodata"]
     tx_addr, tx = secs[".text"]
-    refs = adrp_add_refs(tx_addr, tx)
+    adds, gots = adrp_refs(tx_addr, tx)
     out, start = [], 0
     while (pos := ro.find(ANCHOR, start)) != -1:
         start = pos + 1
-        for off, reg in refs.get(ro_addr + pos, []):
-            if reg != 1:
-                continue
-            for unk_va, lst in refs.items():
-                if not any(abs(o - off) <= 16 and r == 0 for o, r in lst):
-                    continue
-                for off2, reg2 in refs.get(unk_va, []):
+        for off, _reg in adds.get(ro_addr + pos, []):
+            slots = [slot for slot, lst in gots.items() if any(abs(o - off) <= 16 and r == 8 for o, r in lst)]
+            for slot in slots:
+                for off2, reg2 in gots[slot]:
                     if reg2 == 1 and abs(off2 - off) > 16:
                         fs = func_start(tx, off2)
                         if fs is not None and tx_addr + fs not in out:
@@ -152,13 +169,14 @@ class Cap(gdb.Breakpoint):
                     raw = inf.read_memory(ptr, 32).tobytes()
             if raw and len(set(raw)) >= 15:
                 _save(raw)
-                print("CAPTURED", flush=True)
+                print("CAPTURED at " + hex(self.location_addr), flush=True)
                 return True
         except Exception as e:
             print("ERR=" + str(e), flush=True)
         return False
 for a in {addrs}:
-    Cap("*" + hex(a))
+    b = Cap("*" + hex(a))
+    b.location_addr = a
 end
 continue
 detach
