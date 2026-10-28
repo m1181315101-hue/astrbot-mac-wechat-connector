@@ -1,0 +1,4 @@
+{
+  "platforms": {"wechat": "微信", "webchat": "网页面板"},
+  "default_name": "QQ"
+}

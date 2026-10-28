@@ -1,0 +1,36 @@
+# 微信容器 + 连接器。用法见 README「部署」：
+#   cp .env.example .env   # 改网页桌面密码、填 AstrBot 所在的 Docker 网络
+#   docker compose up -d --build
+services:
+  wechat:
+    build:
+      context: .
+      dockerfile: docker/Dockerfile
+    image: astrbot-mac-wechat-connector:local
+    container_name: wechat
+    hostname: wechat              # 固定主机名：换了的话微信可能当成新设备，要重新登录
+    restart: unless-stopped
+    ports:
+      - "127.0.0.1:3001:3001"     # 网页桌面（扫码、查看微信），只绑本机
+    volumes:
+      - ./data:/config            # 微信登录态、聊天数据库、连接器的配置和密钥都在这里，别外传
+    cap_add:
+      - SYS_PTRACE                # 扫码时取数据库密钥要用
+    environment:
+      - PUID=1000
+      - PGID=100
+      - TZ=Asia/Shanghai
+      - LC_ALL=zh_CN.UTF-8
+      - AUTO_START_WECHAT=true
+      - AUTO_START_QQ=false
+      - CUSTOM_USER=${WECHAT_WEB_USER:-wechat}
+      - PASSWORD=${WECHAT_WEB_PASSWORD:?在 .env 里设置 WECHAT_WEB_PASSWORD（网页桌面的密码）}
+    shm_size: 1gb
+    networks:
+      - astrbot
+
+# 加入 AstrBot 所在的网络，连接器才能用 ws://<AstrBot 容器名>:6200/ws 连过去
+networks:
+  astrbot:
+    external: true
+    name: ${ASTRBOT_NETWORK:?在 .env 里填 AstrBot 所在的 Docker 网络名（见 README）}

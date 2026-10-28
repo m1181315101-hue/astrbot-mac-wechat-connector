@@ -1,6 +1,8 @@
-# 微信连接器（WeChat → OneBot v11）
+# AstrBot 微信连接器（Mac 版）
 
-让 AstrBot 用**一个微信小号**收发微信消息。它和 NapCat 接 QQ 的方式一样：对 AstrBot 来说，就是又多了一个 OneBot v11（aiocqhttp）平台。
+在 **Apple 芯片的 Mac** 上，用 Docker 跑**官方 Linux 版微信**，让 [AstrBot](https://github.com/AstrBotDevs/AstrBot) 用**一个微信小号**收发微信消息。它和 NapCat 接 QQ 的方式一样：对 AstrBot 来说，就是又多了一个 OneBot v11（aiocqhttp）平台。
+
+> 从 [dafeiyu-astrbot](https://github.com/m1181315101-hue/dafeiyu-astrbot) 的 `wechat-connector/` 拆出来，保留了原来的提交历史。作者自己的 AstrBot 角色每天在用它接几个微信群和私聊。
 
 微信那边跑的是**官方 Linux 版微信**，装在 Docker 容器里。连接器不改微信客户端，也不碰微信的网络协议：
 
@@ -16,9 +18,9 @@
 
 - **只用小号。** 用程序自动收发消息违反《微信软件许可及服务协议》，账号可能被限制功能甚至封号。别用主号，也别用对你重要的号。
 - **只读自己账号的数据。** 微信的本地数据库是加密的。连接器会在你扫码登录的那一刻，从微信进程里取出这个账号的数据库密钥，用来解密**你自己登录的这个号**的聊天记录。不要拿它去读别人的数据。
-- 腾讯曾对类似的微信数据库解密工具发起过 DMCA 下架。本目录的代码只供个人学习和自用，使用后果由使用者自己承担。
+- 腾讯曾对类似的微信数据库解密工具发起过 DMCA 下架。本仓库的代码只供个人学习和自用，使用后果由使用者自己承担。
 - 被白名单放行的私聊和群消息，会交给 AstrBot 和它配置的大模型处理。把群加进白名单前，先想好群友是否介意。
-- 本目录**不包含**任何账号、密钥、wxid 或聊天内容。`config.json` 和 `keys.json` 都只放在容器的数据目录里，权限 600。
+- 本仓库**不包含**任何账号、密钥、wxid 或聊天内容。`config.json` 和 `keys.json` 都只放在容器的数据目录里，权限 600。
 
 ## 工作原理
 
@@ -46,59 +48,49 @@
 
 ## 环境要求
 
-- Docker。只在 **Apple 芯片的 Mac（arm64）** 上验证过。
+- **Apple 芯片的 Mac**（arm64），装好 Docker Desktop 或 OrbStack。微信容器大约占 1.5～2GB 内存，Docker 分到的内存建议不少于 4GB。
+- **AstrBot 也跑在这台 Mac 的 Docker 里**（官方 Docker 部署就行）。连接器通过 Docker 网络连 AstrBot 的反向 WebSocket。
 - 微信容器：[`nickrunning/wechat-selkies:0.0.17-minimal`](https://github.com/nickrunning/wechat-selkies)，里面是官方 Linux 微信 **4.1.13**。
 - 取密钥用的 `wxkey.py` **只支持 arm64 版微信**。x86_64 的机器可以用 [wcdb-key-tool](https://github.com/TANGandXUE/wcdb-key-tool) 取到 passphrase，写进 `keys.json` 的 `passphrase` 字段（十六进制）。
 - 微信升级以后，数据库格式、密钥派生函数的位置、界面结构都可能变化，所以**容器镜像要钉住版本**，不要让微信自动更新。
+- 验证范围：作者在一台 Apple 芯片 Mac 上跑了整套流程。其中第 2 步（全新容器里扫码抓密钥）是在早期的验证容器里做的；用本仓库 Dockerfile 建的正式容器沿用了那次的登录态和密钥，没有从零再抓一次。代码和 gdb 都一样，理论上没区别，但这是走得最少的一步，卡住了欢迎提 issue。
 
 ## 部署
 
-微信容器的镜像用本目录的 [`docker/Dockerfile`](docker/Dockerfile) 构建，在 `nickrunning/wechat-selkies` 的基础上：
+微信容器的镜像用 [`docker/Dockerfile`](docker/Dockerfile) 构建，在 `nickrunning/wechat-selkies` 的基础上：
 
 - 装好 gdb、xdotool、xclip、无障碍组件（at-spi）、lame；
 - 设好 `PULSE_SERVER`（原镜像只给 `PULSE_RUNTIME_PATH=/defaults`，PulseAudio 要求这个目录归自己所有，微信就连不上声音服务，一点「发语音」就提示「未检测到麦克风设备」）；
 - `init-wxvmic`：PulseAudio 起来之后、桌面（微信）起来之前，建一个虚拟麦克风并设成默认输入。微信只在启动时找麦克风，而且不把 PulseAudio 的「监听源」当麦克风，所以必须在它启动前建好；
 - `svc-wechat-connector`：等配置、密钥、微信都就绪后自动启动连接器，挂了会被重新拉起。
 
-下面的命令都在 AstrBot 的 compose 目录里执行。
+下面的命令都在本仓库目录里执行。
 
 ### 1. 构建并启动微信容器
 
-把本目录放在 compose 目录下（或者改 `context` 指过来），在 compose 里加：
-
-```yaml
-  wechat:
-    build:
-      context: ./dafeiyu-astrbot/wechat-connector
-      dockerfile: docker/Dockerfile
-    image: dafeiyu/wechat-connector:local
-    container_name: wechat
-    hostname: wechat            # 固定主机名：换了的话微信可能当成新设备，要重新登录
-    profiles: ["wechat"]        # 只能点名启停，不会被 docker compose up -d 顺手带起来
-    restart: unless-stopped
-    ports:
-      - "127.0.0.1:3001:3001"   # 网页桌面，只绑本机
-    volumes:
-      - ./wechat:/config        # 微信登录态、聊天数据库、连接器的配置和密钥都在这里
-    cap_add:
-      - SYS_PTRACE              # 第 2 步取密钥要用
-    environment:
-      - PUID=1000
-      - PGID=100
-      - TZ=Asia/Shanghai
-      - LC_ALL=zh_CN.UTF-8
-      - AUTO_START_WECHAT=true
-      - AUTO_START_QQ=false
-      - CUSTOM_USER=${WECHAT_WEB_USER}       # 网页桌面的账号密码，写在同目录 .env 里（权限 600）
-      - PASSWORD=${WECHAT_WEB_PASSWORD}
-    shm_size: 1gb
+```bash
+git clone https://github.com/m1181315101-hue/astrbot-mac-wechat-connector.git
+cd astrbot-mac-wechat-connector
+cp .env.example .env && chmod 600 .env   # 改网页桌面密码，填 AstrBot 所在的 Docker 网络
+docker compose up -d --build
 ```
+
+`.env` 里的 `ASTRBOT_NETWORK` 是 AstrBot 容器所在的 Docker 网络，这样连接器才能按容器名连过去。查法（`astrbot` 换成你的 AstrBot 容器名）：
 
 ```bash
-docker compose --profile wechat up -d --build wechat
+docker inspect astrbot -f '{{range $k, $v := .NetworkSettings.Networks}}{{$k}} {{end}}'
 ```
 
-它和 AstrBot 在同一个 compose 里，所以自动在同一个网络，能用 `astrbot` 这个名字连过去。
+如果查出来只有 `bridge`（用 `docker run` 起的 AstrBot 常这样，默认网络里容器之间不能按名字互相找到），先建一个网络把 AstrBot 接进去，再把 `ASTRBOT_NETWORK` 填成它：
+
+```bash
+docker network create astrbot-net
+docker network connect astrbot-net astrbot
+```
+
+想和 AstrBot 放在同一个 compose 里也行：把 [`compose.yaml`](compose.yaml) 里的 `wechat` 服务抄过去，`build.context` 指向本仓库目录，删掉 `networks` 两段（同一个 compose 里的服务本来就在一个网络里）。
+
+微信容器的数据都在 `./data` 里（登录态、聊天数据库、连接器配置和密钥），已经写进 `.gitignore`，别外传。
 
 ### 2. 扫码登录，同时抓密钥
 
@@ -119,7 +111,7 @@ docker exec -u 0 wechat /usr/bin/python3 /opt/wechat-connector/wxkey.py verify
 
 ### 3. 写配置
 
-把 [`config.example.json`](config.example.json) 复制成 `./wechat/wechat-connector/config.json`（容器里是 `/config/wechat-connector/config.json`），权限设成 600。白名单要填 wxid，可以按备注名或昵称查（必须完全一致）：
+把 [`config.example.json`](config.example.json) 复制成 `./data/wechat-connector/config.json`（容器里是 `/config/wechat-connector/config.json`），权限设成 600。白名单要填 wxid，可以按备注名或昵称查（必须完全一致）：
 
 ```bash
 docker exec -u abc wechat /lsiopy/bin/python3 /opt/wechat-connector/bridge.py lookup "<备注名或群名>"
@@ -129,13 +121,13 @@ docker exec -u abc wechat /lsiopy/bin/python3 /opt/wechat-connector/bridge.py lo
 
 | 配置项 | 说明 |
 |---|---|
-| `astrbot_ws_url` | AstrBot 的反向 WS 地址，例如 `ws://astrbot:6200/ws` |
+| `astrbot_ws_url` | AstrBot 的反向 WS 地址，例如 `ws://astrbot:6200/ws`（`astrbot` 是 AstrBot 的容器名，端口是第 4 步里填的） |
 | `access_token` | 反向 WS 口令，要和 AstrBot 平台里填的一样 |
 | `whitelist` | 允许私聊的人（wxid 列表）。写 `"*"` 就是通讯录里的**所有好友**（以后新加的好友也自动算；群成员这类陌生人、公众号、系统账号不算）。不在里面的人发来的消息不转发、不回复 |
 | `group_whitelist` | 允许的群（`xxx@chatroom` 列表） |
 | `bot_names` | 群里 @ 小号时可能用的名字（比如小号的群昵称）。小号自己的微信昵称会自动加上 |
 | `receive_only` | `true` 时只读消息、写日志，不连 AstrBot。第一次部署建议先开着试 |
-| `face_map` | 可选，指向 QQ 表情插件的 `face_map.json`（复制到 `./wechat/wechat-connector/` 里）。AstrBot 回复里的 QQ 表情会翻回 `[旺柴]` 这种文字，微信会显示成表情 |
+| `face_map` | 可选。如果 AstrBot 装了把 `[旺柴]` 这类文字换成 QQ 表情的插件（比如 [astrbot_plugin_face_convert](https://github.com/m1181315101-hue/dafeiyu-astrbot/tree/main/plugin/astrbot_plugin_face_convert)），把它的 `face_map.json` 复制到 `./data/wechat-connector/` 里再填这一项：回复里的 QQ 表情会翻回 `[旺柴]` 这种文字，微信会显示成表情 |
 | `max_sends_per_minute` | 每分钟最多发几条，默认 20，多出来的排队 |
 | `max_message_age` | 超过这么多秒的旧消息不转发，默认 600。连接器停了一段时间再启动时，不会回一堆过期消息 |
 | `group_voice_min_seconds` | 群里只发不短于这么多秒的语音，默认 20：点歌（翻唱）会发，随口的短语音不发，免得群里语音太多。设成 0 群里所有语音都发，设成 -1 群里一律不发。私聊不受影响。不发时会告诉 AstrBot「发送失败」，插件会改用文字回复 |
@@ -170,7 +162,14 @@ docker exec -u abc wechat /lsiopy/bin/python3 /opt/wechat-connector/bridge.py te
 docker exec -u 0 wechat s6-svc -u /run/service/svc-wechat-connector
 ```
 
-日志在 `./wechat/wechat-connector/connector.log`，也可以看 `docker logs wechat`。
+日志在 `./data/wechat-connector/connector.log`，也可以看 `docker logs wechat`。
+
+## 和 AstrBot 一起用的建议
+
+- **微信上的人在 AstrBot 里是一串数字。** 连接器把每个 wxid 换成一个固定的整数（OneBot 号，`bridge.py lookup` 能查），AstrBot 看到的「QQ 号」「群号」就是它。人格或插件里按 ID 认人的（比如「这个号是主人」），要把微信上的 OneBot 号也写进去。
+- **同时接 QQ 和微信时，告诉它这条来自哪个平台。** AstrBot 给模型的发送者信息只有 User ID 和昵称，不分平台，它在微信上也会说自己在 QQ，也分不清一个 ID 是 QQ 号还是微信的号。可选插件 [`extras/astrbot_plugin_platform_hint`](extras/astrbot_plugin_platform_hint/) 会在系统提示词末尾加一行「【当前平台】这条消息来自微信。」：复制到 AstrBot 的 `data/plugins/` 下，重启 AstrBot（它按平台 ID 判断：默认 `wechat` 是微信、其余当 QQ；你给微信平台起的 ID 不是 `wechat` 的话，把 `config.example.json` 复制成 `config.json` 改对照表）；人格里再写一句「说自己在哪按【当前平台】来，认人时 ID 要和平台对上」。
+- **按用户 ID 区分主人的插件也要加上微信的号。** 比如陪伴类插件的「主用户」名单：漏了的话，插件可能在提示里把你标成「不是主要用户」，比人格里写的更具体，它就不认你了。
+- **「只在指定群回复」这类插件**，记得把微信群的 OneBot 号加进白名单（第 4 步提过）。
 
 ## 安全设计
 
@@ -183,7 +182,7 @@ docker exec -u 0 wechat s6-svc -u /run/service/svc-wechat-connector
 | 一个一个发 | 界面只有一个：所有要发的消息按到达顺序排成一队，一条（连同它的图片、语音）发完再发下一条，日志里会记「前面还有几条」 |
 | 安全重试 | 核对没过、没找到搜索框这类失败都发生在回车之前，一个字没发出去，等 2 秒重试一次；界面驱动卡住这种说不准有没有发出去的，不重试 |
 | 限速 | 每分钟最多 `max_sends_per_minute` 条；打字前按字数停顿 0.5～3 秒 |
-| 急停 | 在 `./wechat/wechat-connector/` 里放一个名为 `STOP` 的文件，就只收不发，删掉恢复 |
+| 急停 | 在 `./data/wechat-connector/` 里放一个名为 `STOP` 的文件，就只收不发，删掉恢复 |
 | 发后确认 | 发完回查数据库，确认真的多了一条自己发出的消息 |
 | 隐私 | 日志只记 OneBot 号、时间和字数，不记内容；解密后的明文只在内存里，不写盘 |
 
@@ -205,5 +204,6 @@ docker exec -u 0 wechat s6-svc -u /run/service/svc-wechat-connector
 - [jessiongod/wechat-onebot-bridge](https://github.com/jessiongod/wechat-onebot-bridge)（MIT）：OneBot v11 反向 WS 客户端的连接方式。
 - [TANGandXUE/wcdb-key-tool](https://github.com/TANGandXUE/wcdb-key-tool)（MIT）：「在登录时断在 WCDB 密钥函数上取 passphrase」的思路。这里改写成了 arm64 版本：用 ADRP+ADD 寻址，参数从 x1、x2 读。
 - [nickrunning/wechat-selkies](https://github.com/nickrunning/wechat-selkies)（MIT）：把官方 Linux 微信装进容器、在浏览器里使用。
+- [dafeiyu-astrbot](https://github.com/m1181315101-hue/dafeiyu-astrbot)：本仓库的出处。
 
-本目录随仓库一起以 [MIT](../LICENSE) 协议开源。
+以 [MIT](LICENSE) 协议开源。

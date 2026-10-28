@@ -1,0 +1,5 @@
+name: astrbot_plugin_platform_hint
+display_name: 平台提示
+desc: 在系统提示词末尾标明这条消息来自 QQ 还是微信，免得她在微信里说自己在 QQ、认主人时把微信的号当成 QQ 号
+version: v1.0.0
+author: dafeiyu-local

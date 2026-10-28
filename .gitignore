@@ -1,0 +1,7 @@
+# 微信数据、连接器配置和密钥：都在 data/ 里，绝不能提交
+data/
+.env
+*.log
+__pycache__/
+*.pyc
+.DS_Store
