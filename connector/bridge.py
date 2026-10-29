@@ -3,6 +3,8 @@
 
 收：轮询本地数据库（wxdb），白名单里的人（私聊；写 "*" 就是所有好友）和白名单里的群发来的新文字 → OneBot 消息事件 → AstrBot
     表情包：按消息里的 cdnurl 下载原图核对（md5、格式、大小），合格的以 image 段（文件名 + 原图地址，和 NapCat 一样）交给 AstrBot
+    照片：解开微信加密存的 .dat（wximg，密钥从本机 kvcomm 推出来），太大的缩小，以 base64 的 image 段交给 AstrBot；
+        原图还没下载完时等几秒，等不到就用缩略图
     聊天记录（别人转发的多条消息）：和 NapCat 的合并转发一样给一个 forward 段，AstrBot 和插件用 get_forward_msg 取各条内容
     群里有人 @ 小号时，事件前面加一个 at 段，AstrBot 按「被 @」处理
     引用回复：事件前面加一个 reply 段，被引用的那条记在内存里，AstrBot 用 get_msg 来取；
@@ -21,6 +23,7 @@
 """
 import argparse
 import asyncio
+import base64
 import json
 import logging
 import logging.handlers
@@ -38,8 +41,9 @@ import media  # noqa: E402
 import onebot  # noqa: E402
 import webui  # noqa: E402
 import wxdb  # noqa: E402
+import wximg  # noqa: E402
 
-VERSION = "0.8.0"
+VERSION = "0.9.0"
 HERE = os.path.dirname(os.path.abspath(__file__))
 # 界面驱动的这些失败都发生在回车之前（回车前核对失败时已经清空输入框），一个字都没发出去，可以重试
 # 发图片后回查数据库确认用：PNG/JPG 存成图片 3，GIF 粘贴后存成动画表情附件 (49, 8)，有时是表情 47
@@ -70,6 +74,10 @@ DEFAULTS = {
     "receive_stickers": True,   # 收别人发的表情包，当成图片交给 AstrBot
     "group_stickers": True,     # 群里的表情包也收（陪伴类插件开着群聊看图时，每张会多一次看图调用）
     "max_sticker_kb": 5120,     # 超过这么大的表情包不收
+    "receive_photos": True,     # 收别人发的照片（解开微信加密存的图片，当成图片交给 AstrBot）
+    "group_photos": True,       # 群里的照片也收（和群表情包一样，陪伴类插件每张会多一次看图调用）
+    "photo_wait_seconds": 3,    # 原图还没下载完时最多等这么久，等不到就用缩略图
+    "kvcomm_dir": "/config/.xwechat/net/kvcomm",  # 推图片密钥用的文件夹（key_<数字>_….statistic）
     "receive_records": True,    # 收别人转发的聊天记录，按合并转发交给 AstrBot（里面的图片、语音换成占位）
     "max_text_chars": 1500,     # 一条文字超过这么多字就按换行拆成几条发
     "max_queue_wait": 150,  # 排队超过这么多秒还没轮到就不发了（AstrBot 等回执最多 180 秒，超时后插件可能已经改发文字）
@@ -280,6 +288,8 @@ class Connector:
         self.stickers: OrderedDict[str, dict] = OrderedDict()  # md5 → 已核对过的 {file, url}，同一个表情包不重复下载
         self.records: OrderedDict[str, dict] = OrderedDict()  # 收到的聊天记录，forward id → 内容，给 get_forward_msg 用
         self.media = media.MediaDir(cfg["media_dir"])
+        self.image_key = None      # (AES 密钥, 异或字节)：第一次收到照片时推，推不出 10 分钟后再试
+        self.image_key_tried = 0.0
         # 给状态页看的：启动时间、收发计数、最近一次数据库有变化的时间、密钥出错的原因、最近几次发送的结果
         self.version = VERSION
         self.started = time.time()
@@ -359,7 +369,15 @@ class Connector:
             self.counts["跳过·旧消息"] += 1
             return
         image = forward = None
-        if m["type"] == 47:
+        label = "表情包"
+        if m["type"] == 3 and self.cfg["receive_photos"]:
+            if chat.endswith("@chatroom") and not self.cfg["group_photos"]:
+                return
+            image, label = await self.photo_image(chat, m), "照片"
+            if not image:
+                self.counts["跳过·照片（解不开）"] += 1
+                return
+        elif m["type"] == 47:
             if not self.cfg["receive_stickers"] or (chat.endswith("@chatroom") and not self.cfg["group_stickers"]):
                 return
             image = await self.sticker_image(m.get("sticker"))
@@ -375,7 +393,7 @@ class Connector:
                 log.info("跳过 %s 的非文字消息 type=%s（只收文字、引用和表情包）", cid, m["type"])
                 self.counts["跳过·" + SKIPPED_TYPES.get(m["type"], f"type {m['type']}")] += 1
             return
-        self.counts[f"{where}·{'表情包' if image else '聊天记录' if forward else '文字'}"] += 1
+        self.counts[f"{where}·{label if image else '聊天记录' if forward else '文字'}"] += 1
         mid = onebot.stable_id(f"{chat}:{m['local_id']}:{m['time']}")
         quote = m.get("quote")
         reply_id = self.remember_quote(chat, quote) if quote else None
@@ -388,7 +406,7 @@ class Connector:
             if at_self:
                 text = self.at_pattern.sub("", text, count=1).strip()
             if image:
-                log.info("群 %s 里 %s 发了表情包", cid, uid)
+                log.info("群 %s 里 %s 发了%s", cid, uid, label)
             elif forward:
                 log.info("群 %s 里 %s 转发了聊天记录（%d 条）", cid, uid, len(m["record"]["items"]))
             else:
@@ -397,7 +415,7 @@ class Connector:
                                                text, at_self, int(m["time"]), reply_id, image, forward)
         else:
             if image:
-                log.info("收到 %s 的私聊表情包", cid)
+                log.info("收到 %s 的私聊%s", cid, label)
             elif forward:
                 log.info("收到 %s 的私聊聊天记录（%d 条）", cid, len(m["record"]["items"]))
             else:
@@ -406,6 +424,36 @@ class Connector:
                                                  m["text"], int(m["time"]), reply_id, image, forward)
         if not self.cfg["receive_only"]:
             await self.ob.push(event)
+
+    async def photo_image(self, chat: str, m: dict) -> dict | None:
+        """照片 → image 段要的 {file: base64://…}。原图（或高清）还没下载完就等一会儿，等不到用缩略图"""
+        if not m.get("photo"):
+            log.info("跳过 %s 的照片（消息里没有文件名）", self.state.id_of(chat))
+            return None
+        if self.image_key is None and time.time() - self.image_key_tried > 600:
+            self.image_key_tried = time.time()
+            self.image_key = await asyncio.to_thread(wximg.find_key, self.cfg["kvcomm_dir"], self.store.acct_dir)
+            log.info("图片密钥：%s", "已从 kvcomm 推出并核对" if self.image_key else "推不出来，照片先跳过（10 分钟后再试）")
+        if self.image_key is None:
+            return None
+        deadline = time.time() + self.cfg["photo_wait_seconds"]
+        while True:
+            paths = await asyncio.to_thread(self.store.photo_files, chat, int(m["time"]), m["photo"])
+            if (paths and not paths[0].endswith("_t.dat")) or time.time() >= deadline:
+                break
+            await asyncio.sleep(0.5)
+        for path in paths:
+            def load(p=path):
+                with open(p, "rb") as f:
+                    data = wximg.decrypt(f.read(), *self.image_key)
+                return wximg.shrink(data) if data else None
+            data = await asyncio.to_thread(load)
+            if data:
+                kind = "缩略图" if path.endswith("_t.dat") else "高清图" if path.endswith("_h.dat") else "原图"
+                log.info("照片解开了（%s，%d KB）", kind, len(data) // 1024)
+                return {"file": "base64://" + base64.b64encode(data).decode(), "url": ""}
+        log.info("跳过 %s 的照片（%s）", self.state.id_of(chat), "文件解不开" if paths else "文件还没下载")
+        return None
 
     async def sticker_image(self, sticker: dict | None) -> dict | None:
         """表情包 → image 段要的 {file: 文件名, url: 原图地址}。先下载一次核对（能下、是图片、md5 对、不太大），

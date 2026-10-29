@@ -117,6 +117,15 @@ async def status(c, probe: WindowProbe) -> dict:
     else:
         checks.append(("发送", "ok", f"排队 {queued} 条" if queued else "空闲"))
 
+    if not c.cfg["receive_photos"]:
+        checks.append(("照片", "ok", "没开（receive_photos）"))
+    elif c.image_key:
+        checks.append(("照片", "ok", "图片密钥已推出，收到的照片会解开交给 AstrBot"))
+    elif c.image_key_tried:
+        checks.append(("照片", "warn", "图片密钥推不出来（kvcomm_dir 里没有 key_ 文件，或者解不开），照片先跳过"))
+    else:
+        checks.append(("照片", "ok", "还没收到过照片，收到第一张时推图片密钥"))
+
     async with c.db_lock:
         people = len(await asyncio.to_thread(c.private_targets))
     level = "bad" if any(x[1] == "bad" for x in checks) else "warn" if any(x[1] == "warn" for x in checks) else "ok"

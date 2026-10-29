@@ -117,10 +117,14 @@ def _reply_seg(reply_id: int | None) -> tuple[list[dict], str]:
 
 def _image_seg(image: dict | None) -> tuple[list[dict], str]:
     """收到的表情包：放一个 image 段，格式和 NapCat 一样（file 是文件名，url 是下载地址）。
-    不用 base64://：AstrBot 本身认，但有的插件（比如陪伴插件的群聊看图）只会按 file 读本地文件、读不到再用 url"""
+    表情包不用 base64://：AstrBot 本身认，但有的插件（比如陪伴插件的群聊看图）先按 file 读本地文件、读不到再用 url。
+    照片没有能下载的地址，只能 file 放 base64://，不带 url"""
     if not image:
         return [], ""
-    return [{"type": "image", "data": {"file": image["file"], "url": image["url"]}}], "[图片]"
+    data = {"file": image["file"]}
+    if image.get("url"):
+        data["url"] = image["url"]
+    return [{"type": "image", "data": data}], "[图片]"
 
 
 # 陪伴插件（astrbot_plugin_private_companion）看到消息文字里有这几个词，会先拿这个人最近一次的聊天记录，

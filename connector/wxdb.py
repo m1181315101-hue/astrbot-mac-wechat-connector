@@ -8,6 +8,7 @@ passphrase 由 wxkey.py 在扫码登录时抓取，存在 keys.json（600）里�
 """
 import ctypes
 import ctypes.util
+import datetime
 import glob
 import hashlib
 import hmac
@@ -438,7 +439,7 @@ class WeChatStore:
     def new_messages(self, wxid: str, marks: dict[str, int]) -> list[dict]:
         """marks：{库文件名: 已处理到的 local_id}，原地更新；返回对方发来的新消息（含非文字，type 区分）。
         引用回复当成文字（type 1，text 是新说的话），另带 quote：被引用的那条（见 parse_quote）。
-        表情包（type 47）另带 sticker：下载地址和 md5（见 parse_sticker）。
+        表情包（type 47）另带 sticker：下载地址和 md5（见 parse_sticker）。照片（type 3）另带 photo：加密文件的名字。
         调用方启动时先用 latest_ids 把已有会话的水位设到最新（不回放历史）；
         之后才出现的会话表（第一次聊天、新分库）不在 marks 里，从头读。"""
         table, out = self.table_of(wxid), []
@@ -448,9 +449,10 @@ class WeChatStore:
                 continue
             me = self._self_rowid(con)
             names = dict(con.execute("select rowid, user_name from Name2Id"))
-            rows = con.execute(f"select local_id, server_id, local_type, create_time, real_sender_id, message_content "
-                               f"from {table} where local_id > ? order by local_id", (marks.get(name, 0),)).fetchall()
-            for local_id, server_id, local_type, create_time, sender, content in rows:
+            rows = con.execute(f"select local_id, server_id, local_type, create_time, real_sender_id, message_content, "
+                               f"packed_info_data from {table} where local_id > ? order by local_id",
+                               (marks.get(name, 0),)).fetchall()
+            for local_id, server_id, local_type, create_time, sender, content, packed in rows:
                 marks[name] = local_id
                 if sender == me:
                     continue
@@ -473,9 +475,27 @@ class WeChatStore:
                     sticker, text = parse_sticker(text), ""
                 elif is_record:
                     record, text = parse_record(text), ""
+                photo = None
+                if base_type == 3:  # packed_info_data 里那串 32 位十六进制就是 .dat 的文件名
+                    found = re.search(rb"[0-9a-f]{32}", packed or b"")
+                    photo = found.group().decode() if found else None
                 out.append({"local_id": local_id, "server_id": server_id, "type": base_type, "time": create_time,
                             "sender": names.get(sender, ""), "text": text, "quote": quote, "sticker": sticker,
-                            "record": record})
+                            "record": record, "photo": photo})
+        return out
+
+    def photo_files(self, wxid: str, ts: int, name: str) -> list[str]:
+        """照片的加密文件，按 原图、高清、缩略图 排；还没下载的不在里面。
+        按月份分文件夹（本地时间），月初月底差几个小时时两边都找"""
+        months = dict.fromkeys(datetime.datetime.fromtimestamp(t).strftime("%Y-%m") for t in (ts, ts - 43200, ts + 43200))
+        base = os.path.join(self.acct_dir, "msg", "attach", hashlib.md5(wxid.encode()).hexdigest())
+        out = []
+        for suffix in ("", "_h", "_t"):
+            for month in months:
+                path = os.path.join(base, month, "Img", f"{name}{suffix}.dat")
+                if os.path.exists(path):
+                    out.append(path)
+                    break
         return out
 
     @staticmethod
