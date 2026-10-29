@@ -12,7 +12,7 @@
     引用回复：事件前面加一个 reply 段，被引用的那条记在内存里，AstrBot 用 get_msg 来取；
     引用的是小号的话，AstrBot 当成在叫它（和 QQ 上回复机器人的消息一样）
 回：AstrBot 的 send_private_msg / send_group_msg → 发送队列 → 界面驱动（wxui）切换会话、核对、粘贴、回车
-    → 回查数据库确认。文字、图片（GIF 是动画表情）、语音（原生语音条，不行就退回 mp3 文件）按原顺序一段一段发
+    → 回查数据库确认。文字、图片（GIF 默认转成静态图）、语音（原生语音条，不行就退回 mp3 文件）按原顺序一段一段发
     界面只有一个：所有要发的消息按到达顺序排成一队，一条（含它的所有段）发完再发下一条；
     界面没动过、一个字没发出去的失败（核对没过、没找到搜索框）等 2 秒重试一次
 状态页：容器里 127.0.0.1:6299 上的网页（webui.py），nginx 把网页桌面的 /wxc/ 转过来：看状态、暂停发送、改常用设置
@@ -46,7 +46,7 @@ import webui  # noqa: E402
 import wxdb  # noqa: E402
 import wximg  # noqa: E402
 
-VERSION = "0.11.0"
+VERSION = "0.11.1"
 HERE = os.path.dirname(os.path.abspath(__file__))
 # 界面驱动的这些失败都发生在回车之前（回车前核对失败时已经清空输入框），一个字都没发出去，可以重试
 # 发图片后回查数据库确认用：PNG/JPG 存成图片 3，GIF 粘贴后存成动画表情附件 (49, 8)，有时是表情 47
@@ -77,6 +77,7 @@ DEFAULTS = {
     "receive_stickers": True,   # 收别人发的表情包，当成图片交给 AstrBot
     "group_stickers": True,     # 群里的表情包也收（陪伴类插件开着群聊看图时，每张会多一次看图调用）
     "max_sticker_kb": 5120,     # 超过这么大的表情包不收
+    "send_gif_as_still": True,  # AstrBot 发来的 GIF 取中间一帧当图片发（粘贴 GIF 时对方有时收到的是一个 .gif 文件）
     "receive_photos": True,     # 收别人发的照片（解开微信加密存的图片，当成图片交给 AstrBot）
     "group_photos": True,       # 群里的照片也收（和群表情包一样，陪伴类插件每张会多一次看图调用）
     "photo_wait_seconds": 3,    # 原图还没下载完时最多等这么久，等不到就用缩略图
@@ -785,7 +786,7 @@ class Connector:
         if not data:
             return [], "取不到媒体数据（可能是只在 AstrBot 容器里的文件路径）", b""
         if kind == "image":
-            path = self.media.image_file(data)
+            path = self.media.image_file(data, still_gif=self.cfg["send_gif_as_still"])
             return ([("file", path, 0.0)], "", data) if path else ([], "不认识的图片格式", data)
         seconds = media.audio_seconds(data)
         min_seconds = self.cfg["group_voice_min_seconds"]

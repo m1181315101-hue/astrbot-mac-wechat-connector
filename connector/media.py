@@ -1,7 +1,8 @@
 """AstrBot 发来的图片、语音 → 微信能发的临时文件
 
 AstrBot 的 aiocqhttp 适配器把 Image / Record 都转成 base64://… 放进消息段，不用和 AstrBot 共享文件夹。
-- 图片：GIF / PNG / JPEG 原样落盘；WEBP、BMP 转成 PNG。粘贴后 GIF 是动画表情，其余是图片
+- 图片：PNG / JPEG 原样落盘；WEBP、BMP 转成 PNG；GIF 默认取中间一帧转成 PNG（send_gif_as_still），
+  不转的话粘贴后是动画表情，但对方有时收到的是一个 .gif 文件
 - 语音：wav 用 lame 转成 mp3，mp3 原样用；粘贴后是音频文件（电脑版微信发不了「按住说话」的语音条）
 临时文件放在 media_dir 下各自的子目录里，超过 10 分钟的自动清掉。
 """
@@ -114,14 +115,18 @@ class MediaDir:
         self._cleanup()
         return tempfile.mkdtemp(dir=self.root)
 
-    def image_file(self, data: bytes) -> str | None:
+    def image_file(self, data: bytes, still_gif: bool = False) -> str | None:
+        """still_gif：GIF 取中间一帧存成 PNG 当图片发（粘贴 GIF 时对方有时收到的是一个 .gif 文件）"""
         ext = image_ext(data)
         if not ext:
             return None
-        if ext in ("webp", "bmp"):
+        if ext in ("webp", "bmp") or (ext == "gif" and still_gif):
             from PIL import Image  # 只在要转格式时才用
             buf = io.BytesIO()
-            Image.open(io.BytesIO(data)).save(buf, "PNG")
+            with Image.open(io.BytesIO(data)) as im:
+                if ext == "gif" and getattr(im, "n_frames", 1) > 1:
+                    im.seek(im.n_frames // 2)  # 中间那帧：有些动图第一帧是空的
+                im.convert("RGBA").save(buf, "PNG")
             data, ext = buf.getvalue(), "png"
         path = os.path.join(self._new_dir(), f"image.{ext}")
         with open(path, "wb") as f:
