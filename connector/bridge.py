@@ -9,10 +9,12 @@
     聊天记录（别人转发的多条消息）：和 NapCat 的合并转发一样给一个 forward 段，AstrBot 和插件用 get_forward_msg 取各条内容
     群里有人 @ 小号时，事件前面加一个 at 段，AstrBot 按「被 @」处理
     有人进群：群里的入群提示转成和 NapCat 一样的 group_increase 通知（带新人昵称），欢迎类插件就能用
+    拍一拍：有人拍小号时，转成和 NapCat 一样的戳一戳通知（notice / notify / poke），戳一戳类插件就能用
     引用回复：事件前面加一个 reply 段，被引用的那条记在内存里，AstrBot 用 get_msg 来取；
     引用的是小号的话，AstrBot 当成在叫它（和 QQ 上回复机器人的消息一样）
 回：AstrBot 的 send_private_msg / send_group_msg → 发送队列 → 界面驱动（wxui）切换会话、核对、粘贴、回车
     → 回查数据库确认。文字、图片（GIF 默认转成静态图）、语音（原生语音条，不行就退回 mp3 文件）按原顺序一段一段发
+    引用发不出去（界面上做不了），群里回的那条后面已经有别人说过话时，改成在开头写「@名字」，免得看不出在回谁
     界面只有一个：所有要发的消息按到达顺序排成一队，一条（含它的所有段）发完再发下一条；
     界面没动过、一个字没发出去的失败（核对没过、没找到搜索框）等 2 秒重试一次
 状态页：容器里 127.0.0.1:6299 上的网页（webui.py），nginx 把网页桌面的 /wxc/ 转过来：看状态、暂停发送、改常用设置
@@ -46,7 +48,7 @@ import webui  # noqa: E402
 import wxdb  # noqa: E402
 import wximg  # noqa: E402
 
-VERSION = "0.11.1"
+VERSION = "0.12.0"
 HERE = os.path.dirname(os.path.abspath(__file__))
 # 界面驱动的这些失败都发生在回车之前（回车前核对失败时已经清空输入框），一个字都没发出去，可以重试
 # 发图片后回查数据库确认用：PNG/JPG 存成图片 3，GIF 粘贴后存成动画表情附件 (49, 8)，有时是表情 47
@@ -87,6 +89,9 @@ DEFAULTS = {
     "photo_port": 6298,
     "photo_url_base": "http://wechat:6298",  # AstrBot 容器里访问微信容器用的地址
     "receive_records": True,    # 收别人转发的聊天记录，按合并转发交给 AstrBot（里面的图片、语音换成占位）
+    "receive_pats": True,       # 有人拍小号时转成戳一戳通知
+    # 微信上发不了引用：AstrBot 要引用回复群里某条消息，而那条后面已经有别人说过话时，在开头写「@名字」
+    "reply_mention_when_busy": True,
     "max_text_chars": 1500,     # 一条文字超过这么多字就按换行拆成几条发
     "max_queue_wait": 150,  # 排队超过这么多秒还没轮到就不发了（AstrBot 等回执最多 180 秒，超时后插件可能已经改发文字）
     "webui_host": "127.0.0.1",  # 只读状态页，容器里的 nginx 把 /wxc/ 转过来（沿用网页桌面的密码）
@@ -301,6 +306,7 @@ class Connector:
         self.image_key_tried = 0.0
         self.photo_cache: OrderedDict[str, tuple[bytes, float]] = OrderedDict()  # 下载地址里的随机名 → (图片, 过期时间)
         self.member_names: OrderedDict[str, str] = OrderedDict()  # 入群提示里的新人昵称：多半不在通讯录里，@ 他时要用
+        self.group_recent: dict[str, deque] = {}  # 群 → 最近的 (消息号, 发言人 wxid)，判断引用回复要不要改成 @
         # 给状态页看的：启动时间、收发计数、最近一次数据库有变化的时间、密钥出错的原因、最近几次发送的结果
         self.version = VERSION
         self.started = time.time()
@@ -379,6 +385,9 @@ class Connector:
             log.info("跳过 %s 的旧消息（%d 秒前）", cid, age)
             self.counts["跳过·旧消息"] += 1
             return
+        if chat.endswith("@chatroom") and m["sender"]:  # 不管收不收这一条，都算有人说过话
+            recent = self.group_recent.setdefault(chat, deque(maxlen=50))
+            recent.append((onebot.stable_id(f"{chat}:{m['local_id']}:{m['time']}"), m["sender"]))
         image = forward = None
         label = "表情包"
         if m["type"] == 3 and self.cfg["receive_photos"]:
@@ -397,6 +406,9 @@ class Connector:
                 return
         elif m.get("joined"):
             await self.deliver_join(chat, m)
+            return
+        elif m.get("pat"):
+            await self.deliver_pat(chat, m)
             return
         elif m.get("record"):
             if not self.cfg["receive_records"]:
@@ -458,6 +470,46 @@ class Connector:
         if members:
             log.info("群 %s 进了 %d 个新人%s", cid, len(members), "（有人邀请）" if inviter else "")
             self.counts["群·有人进群"] += len(members)
+
+    async def deliver_pat(self, chat: str, m: dict) -> None:
+        """拍一拍 → 戳一戳通知；只转拍小号的，别人之间互拍不管"""
+        pat, cid = m["pat"], self.state.id_of(chat)
+        if pat["patted"] != self.store.self_wxid or pat["from"] == self.store.self_wxid:
+            return
+        if not self.cfg["receive_pats"]:
+            self.counts["跳过·拍一拍"] += 1
+            return
+        group = chat.endswith("@chatroom")
+        uid = self.state.id_of(pat["from"])
+        event = onebot.poke_event(self.self_id, cid if group else 0, uid, self.name_of(pat["from"]),
+                                  pat["suffix"], int(m["time"]))
+        log.info("%s %s 拍了拍小号", f"群 {cid} 里" if group else "私聊", uid)
+        self.counts[("群" if group else "私聊") + "·拍一拍"] += 1
+        if not self.cfg["receive_only"]:
+            await self.ob.push(event)
+
+    def busy_reply_mention(self, chat: str, message) -> str:
+        """AstrBot 要引用回复的那条（reply 段）后面已经有别人说过话，就返回「@名字 」写在开头；
+        那条找不到、后面只有他自己在说、或者已经 @ 了他，返回空"""
+        if not isinstance(message, list):
+            return ""
+        segs = [s for s in message if isinstance(s, dict)]
+        reply = next((s for s in segs if s.get("type") == "reply"), None)
+        try:
+            mid = int((reply or {}).get("data", {}).get("id") or 0)
+        except (TypeError, ValueError):
+            return ""
+        recent = list(self.group_recent.get(chat) or [])
+        index = next((i for i, (m, _) in enumerate(recent) if m == mid), None)
+        if index is None:
+            return ""
+        sender = recent[index][1]
+        if not any(other != sender for _, other in recent[index + 1:]):
+            return ""
+        if any(s.get("type") == "at" and str(s.get("data", {}).get("qq")) == str(self.state.id_of(sender)) for s in segs):
+            return ""
+        name = self.name_of(sender)
+        return f"@{name} " if name and name != sender else ""
 
     def name_of(self, wxid: str) -> str:
         """备注名、昵称；通讯录里没有（比如刚进群的人）就用入群提示里的昵称"""
@@ -732,6 +784,10 @@ class Connector:
             return "failed", 1403, {"message": "目标不在白名单"}
         parts, dropped = message_parts(params.get("message"), self.face_names, self._at_name)
         parts = [(k, c) for k, v in parts for c in (split_long_text(v, self.cfg["max_text_chars"]) if k == "text" else [v])]
+        mention = self.busy_reply_mention(wxid, params.get("message")) if group and self.cfg["reply_mention_when_busy"] else ""
+        if mention and parts and parts[0][0] == "text" and not parts[0][1].startswith("@"):
+            parts[0] = ("text", mention + parts[0][1])
+            log.info("回的那条后面已经有别人说话，开头加了 @")
         if dropped:
             log.info("丢掉不支持的消息段 %s", dropped)
         if not parts:

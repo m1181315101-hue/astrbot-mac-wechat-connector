@@ -204,3 +204,13 @@ def group_increase_event(self_id: int, group_id: int, user_id: int, operator_id:
     return {"time": ts, "self_id": self_id, "post_type": "notice", "notice_type": "group_increase",
             "sub_type": "invite" if operator_id else "approve", "group_id": group_id, "user_id": user_id,
             "operator_id": operator_id, "nickname": nickname}
+
+
+def poke_event(self_id: int, group_id: int, user_id: int, nickname: str, suffix: str, ts: int) -> dict:
+    """拍一拍：和 NapCat 的戳一戳通知（notice / notify / poke）一样，target_id 是被拍的人（只转拍小号的）；私聊没有 group_id。
+    多带 nickname 和 suffix（OneBot 里没有）：拍的人叫什么、拍一拍后缀（「的小尾巴」这种，没设就是空的）"""
+    event = {"time": ts, "self_id": self_id, "post_type": "notice", "notice_type": "notify", "sub_type": "poke",
+             "user_id": user_id, "sender_id": user_id, "target_id": self_id, "nickname": nickname, "suffix": suffix}
+    if group_id:
+        event["group_id"] = group_id
+    return event

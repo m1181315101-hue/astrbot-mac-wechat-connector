@@ -32,7 +32,8 @@ QUIET_WARN_SECONDS = 6 * 3600  # 这么久数据库都没变化，多半是掉�
 MAX_BODY = 64 * 1024
 # 页面上能改的设置：其余的（口令、地址、端口、目录）只能改 config.json
 TOGGLES = {"receive_only": "只收不发", "receive_stickers": "收表情包", "group_stickers": "群里的表情包也收",
-           "receive_photos": "收照片", "group_photos": "群里的照片也收", "receive_records": "收聊天记录"}
+           "receive_photos": "收照片", "group_photos": "群里的照片也收", "receive_records": "收聊天记录",
+           "receive_pats": "收拍一拍", "reply_mention_when_busy": "群里回复前面插了别人的话时加 @"}
 NUMBERS = {"max_sends_per_minute": ("每分钟最多发几条", 1, 60), "max_message_age": ("多少秒以前的消息不收", 30, 86400),
            "photo_wait_seconds": ("等原图最多几秒", 0, 30)}
 CHOICES = {"voice_mode": ("语音怎么发", {"native": "原生语音条", "file": "mp3 文件"})}

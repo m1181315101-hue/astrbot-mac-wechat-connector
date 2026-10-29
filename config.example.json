@@ -17,5 +17,7 @@
   "photo_port": 6298,
   "photo_url_base": "http://wechat:6298",
   "receive_records": true,
+  "receive_pats": true,
+  "reply_mention_when_busy": true,
   "webui_port": 6299
 }

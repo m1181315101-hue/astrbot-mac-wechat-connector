@@ -355,6 +355,24 @@ def parse_sticker(xml_text: str) -> dict | None:
     return {"url": url, "md5": (emoji.get("md5") or "").strip().lower()}
 
 
+def parse_pat(xml_text: str) -> dict | None:
+    """拍一拍（local_type 49、子类型 62）：appmsg 里的 patinfo 写着谁拍了谁，
+    template 形如「"${wxid_a}" 拍了拍 "${wxid_b}" 的小尾巴」，被拍的人后面那段是他自己设的后缀。
+    返回 {"from": 拍的人 wxid, "patted": 被拍的人 wxid, "suffix": 后缀}；不是拍一拍返回 None"""
+    try:
+        info = ET.fromstring(xml_text.strip()).find(".//patinfo")
+    except ET.ParseError:
+        return None
+    if info is None:
+        return None
+    sender, patted = (info.findtext("fromusername") or "").strip(), (info.findtext("pattedusername") or "").strip()
+    if not sender or not patted:
+        return None
+    template = info.findtext("template") or ""
+    found = re.search(r"\$\{" + re.escape(patted) + r"\}\"?(.*)$", template.strip())
+    return {"from": sender, "patted": patted, "suffix": found.group(1).strip() if found else ""}
+
+
 def parse_join(xml_text: str) -> dict | None:
     """群里的入群提示（local_type 10000，sysmsgtemplate）：模板如「$username$邀请$names$加入了群聊」
     「$adder$通过扫描$from$分享的二维码加入群聊」，link_list 里每个占位对应 memberlist（username 是 wxid）。
@@ -468,7 +486,7 @@ class WeChatStore:
         """marks：{库文件名: 已处理到的 local_id}，原地更新；返回对方发来的新消息（含非文字，type 区分）。
         引用回复当成文字（type 1，text 是新说的话），另带 quote：被引用的那条（见 parse_quote）。
         表情包（type 47）另带 sticker：下载地址和 md5（见 parse_sticker）。照片（type 3）另带 photo：加密文件的名字。
-        群里的入群提示（type 10000）另带 joined：新人和邀请人（见 parse_join）。
+        群里的入群提示（type 10000）另带 joined：新人和邀请人（见 parse_join）。拍一拍（type 49）另带 pat（见 parse_pat）。
         调用方启动时先用 latest_ids 把已有会话的水位设到最新（不回放历史）；
         之后才出现的会话表（第一次聊天、新分库）不在 marks 里，从头读。"""
         table, out = self.table_of(wxid), []
@@ -488,8 +506,9 @@ class WeChatStore:
                 base_type, sub_type = local_type & 0xFFFFFFFF, local_type >> 32  # 高 32 位是子类型（链接、文件等）
                 is_quote = base_type == 49 and sub_type == 57
                 is_record = base_type == 49 and sub_type == 19
+                is_pat = base_type == 49 and sub_type == 62
                 text, quote, sticker, record = (decode_content(content) if base_type in (1, 47) or is_quote or is_record
-                                                else ""), None, None, None
+                                                or is_pat else ""), None, None, None
                 if wxid.endswith("@chatroom"):  # 群里别人发的文字、引用带「发送者wxid:换行」前缀
                     text = GROUP_PREFIX.sub("", text, count=1)
                 if is_quote:
@@ -511,6 +530,9 @@ class WeChatStore:
                     sticker, text = parse_sticker(text), ""
                 elif is_record:
                     record, text = parse_record(text), ""
+                pat = parse_pat(text) if is_pat else None
+                if is_pat:
+                    text = ""
                 photo = joined = None
                 if base_type == 10000 and wxid.endswith("@chatroom"):
                     joined = parse_join(GROUP_PREFIX.sub("", decode_content(content), count=1))
@@ -519,7 +541,7 @@ class WeChatStore:
                     photo = found.group().decode() if found else None
                 out.append({"local_id": local_id, "server_id": server_id, "type": base_type, "time": create_time,
                             "sender": names.get(sender, ""), "text": text, "quote": quote, "sticker": sticker,
-                            "record": record, "photo": photo, "joined": joined})
+                            "record": record, "photo": photo, "joined": joined, "pat": pat})
         return out
 
     def photo_files(self, wxid: str, ts: int, name: str) -> list[str]:
