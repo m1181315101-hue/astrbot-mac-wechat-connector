@@ -45,7 +45,7 @@ import webui  # noqa: E402
 import wxdb  # noqa: E402
 import wximg  # noqa: E402
 
-VERSION = "0.9.2"
+VERSION = "0.9.3"
 HERE = os.path.dirname(os.path.abspath(__file__))
 # 界面驱动的这些失败都发生在回车之前（回车前核对失败时已经清空输入框），一个字都没发出去，可以重试
 # 发图片后回查数据库确认用：PNG/JPG 存成图片 3，GIF 粘贴后存成动画表情附件 (49, 8)，有时是表情 47
@@ -434,7 +434,7 @@ class Connector:
 
     async def photo_image(self, chat: str, m: dict, wait: bool = True, data_url: bool = False) -> dict | None:
         """照片 → image 段要的 {file: 文件名, url: 下载地址}。原图（或高清）还没下载完就等一会儿（wait），等不到用缩略图。
-        data_url：再带一份 data:image/…;base64（给引用里的图片用，见 remember_quote）"""
+        data_url：再带一份 image_data_url（data:image/…;base64，给引用里的图片用，见 remember_quote）"""
         if not m.get("photo"):
             log.info("跳过 %s 的照片（消息里没有文件名）", self.state.id_of(chat))
             return None
@@ -461,7 +461,7 @@ class Connector:
                 kind = "缩略图" if path.endswith("_t.dat") else "高清图" if path.endswith("_h.dat") else "原图"
                 log.info("照片解开了（%s，%d KB）", kind, len(data) // 1024)
                 ext = media.image_ext(data)
-                extra = {"data_url": f"data:image/{ext.replace('jpg', 'jpeg')};base64," + base64.b64encode(data).decode()} if data_url else {}
+                extra = {"image_data_url": f"data:image/{ext.replace('jpg', 'jpeg')};base64," + base64.b64encode(data).decode()} if data_url else {}
                 if not self.cfg["photo_port"]:
                     return {"file": "base64://" + base64.b64encode(data).decode(), "url": "", **extra}
                 token = secrets.token_urlsafe(16)
@@ -529,11 +529,31 @@ class Connector:
                 self.stickers.popitem(last=False)
         return image
 
+    async def quote_image(self, chat: str, quote: dict) -> dict | None:
+        """被引用的照片、表情包 → 图片段（带 image_data_url）；不是图返回 None"""
+        if quote.get("photo"):
+            return await self.photo_image(chat, {"photo": quote["photo"], "time": quote["photo_time"]},
+                                          wait=False, data_url=True)
+        if not quote.get("sticker"):
+            return None
+        image = await self.sticker_image(quote["sticker"])
+        if image:
+            try:
+                data = await asyncio.to_thread(media.fetch_sticker, quote["sticker"]["url"], quote["sticker"]["md5"],
+                                               self.cfg["max_sticker_kb"] * 1024)
+            except Exception:
+                data = None
+            if data:
+                ext = media.image_ext(data).replace("jpg", "jpeg")
+                image = {**image, "image_data_url": f"data:image/{ext};base64," + base64.b64encode(data).decode()}
+        return image
+
     async def remember_quote(self, chat: str, quote: dict) -> int:
         """把被引用的那条做成一条消息记下来（最多 200 条），返回它的消息 ID；
         原作者是小号时 user_id 用小号自己的 ID，AstrBot 才知道引用的是它。
         引用的是照片、表情包时带上图片段：AstrBot 按 url 取图；陪伴插件读引用里的图只肯下公网地址，
-        所以再带一份 data_url（data:image/…;base64），它认这种"""
+        所以再带一份 image_data_url（data:image/…;base64），它按字段名里的 image 认图。
+        嵌套引用（被引用的那条也是在引用别人）：文字后面注明它在回复谁的什么，那一层是图就把图带上"""
         rid = onebot.stable_id(f"{chat}:quote:{quote['svrid'] or quote['text']}")
         author = quote["sender"] or chat
         if author == self.store.self_wxid:
@@ -543,22 +563,12 @@ class Connector:
         ts = quote["time"] or int(time.time())
         # 引用的是聊天记录：被引用的那条做成合并转发，标题已经在「[对话记录] 标题」里
         forward = self.remember_record(chat, quote["record"], f"quote:{rid}") if quote.get("record") else None
-        image = None
-        if quote.get("photo"):
-            image = await self.photo_image(chat, {"photo": quote["photo"], "time": quote["photo_time"]},
-                                           wait=False, data_url=True)
-        elif quote.get("sticker"):
-            image = await self.sticker_image(quote["sticker"])
-            if image:
-                try:
-                    data = await asyncio.to_thread(media.fetch_sticker, quote["sticker"]["url"], quote["sticker"]["md5"],
-                                                   self.cfg["max_sticker_kb"] * 1024)
-                except Exception:
-                    data = None
-                if data:
-                    ext = media.image_ext(data).replace("jpg", "jpeg")
-                    image = {**image, "data_url": f"data:image/{ext};base64," + base64.b64encode(data).decode()}
-        text = "" if forward or image else quote["text"]
+        image = await self.quote_image(chat, quote)
+        nested, note = quote.get("nested"), ""
+        if nested:
+            image = image or await self.quote_image(chat, nested)
+            note = f"（这条是在回复{nested['name'] or '别人'}：{nested['text']}）"
+        text = "" if forward or (image and not nested) else quote["text"] + note
         if chat.endswith("@chatroom"):
             msg = onebot.group_message_event(self.self_id, self.state.id_of(chat), uid, name, rid,
                                              text, False, ts, image=image, forward=forward)

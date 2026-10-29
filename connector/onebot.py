@@ -124,8 +124,8 @@ def _image_seg(image: dict | None) -> tuple[list[dict], str]:
     data = {"file": image["file"]}
     if image.get("url"):
         data["url"] = image["url"]
-    if image.get("data_url"):  # 只有引用里的图片带，给只认公网地址的插件用
-        data["data_url"] = image["data_url"]
+    if image.get("image_data_url"):  # 只有引用里的图片带，给只认公网地址的插件用（陪伴插件按字段名里有没有 image 认图）
+        data["image_data_url"] = image["image_data_url"]
     return [{"type": "image", "data": data}], "[图片]"
 
 

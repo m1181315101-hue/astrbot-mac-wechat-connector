@@ -262,10 +262,11 @@ RECORD_PLACEHOLDER = {2: "[图片]", 3: "[语音]", 4: "[视频]", 5: "[链接]"
                       17: "[聊天记录]", 19: "[小程序]", 22: "[视频号]", 29: "[音乐]", 37: "[表情]"}
 
 
-def parse_quote(xml_text: str) -> dict | None:
+def parse_quote(xml_text: str, depth: int = 0) -> dict | None:
     """引用回复（local_type 49，子类型 57）：appmsg/title 是新说的话，appmsg/refermsg 是被引用的那条。
     群里 refermsg 的 chatusr 是原作者、fromusr 是群；chatusr 为空时原作者看 fromusr。
-    被引用的是文字就带原文，图片、表情这类换成占位，链接、文件和引用取标题。解析不了返回 None"""
+    被引用的是文字就带原文，图片、表情这类换成占位，链接、文件和引用取标题。解析不了返回 None。
+    被引用的那条本身也是引用时（嵌套引用），它引用的那条放在 nested 里，只往下多解一层"""
     try:
         appmsg = ET.fromstring(xml_text.strip()).find("appmsg")
     except ET.ParseError:
@@ -277,7 +278,7 @@ def parse_quote(xml_text: str) -> dict | None:
         return None
     rtype = int((ref.findtext("type") or "0").strip() or 0)
     content = ref.findtext("content") or ""
-    record = None
+    record = nested = None
     if rtype == 1:
         quoted = content
     elif rtype == 49:
@@ -287,13 +288,14 @@ def parse_quote(xml_text: str) -> dict | None:
         except ET.ParseError:
             quoted = "[链接]"
         record = parse_record(inner)  # 引用的是聊天记录时带上内容
+        nested = parse_quote(inner, depth + 1) if depth < 1 else None
     else:
         quoted = QUOTE_PLACEHOLDER.get(rtype, "[消息]")
     return {"title": appmsg.findtext("title") or "",
             "sender": (ref.findtext("chatusr") or ref.findtext("fromusr") or "").strip(),
             "name": ref.findtext("displayname") or "", "svrid": (ref.findtext("svrid") or "").strip(),
             "time": int((ref.findtext("createtime") or "0").strip() or 0), "text": quoted, "record": record,
-            "type": rtype}
+            "type": rtype, "nested": nested}
 
 
 def parse_record(xml_text: str) -> dict | None:
@@ -474,6 +476,11 @@ class WeChatStore:
                             quote["record"] = self._original_record(con, table, int(quote["svrid"])) or quote["record"]
                         if quote["type"] in (3, 47) and quote["svrid"].isdigit():
                             self._quoted_media(con, table, int(quote["svrid"]), quote)
+                        if quote["type"] == 49 and quote["nested"] is None and quote["svrid"].isdigit():
+                            quote["nested"] = self._original_quote(con, table, int(quote["svrid"]))
+                        nested = quote["nested"]
+                        if nested and nested["type"] in (3, 47) and nested["svrid"].isdigit():
+                            self._quoted_media(con, table, int(nested["svrid"]), nested)
                 elif base_type == 47:
                     sticker, text = parse_sticker(text), ""
                 elif is_record:
@@ -516,6 +523,13 @@ class WeChatStore:
                 quote["photo"], quote["photo_time"] = found.group().decode(), ct
         elif base == 47:
             quote["sticker"] = parse_sticker(GROUP_PREFIX.sub("", decode_content(content), count=1))
+
+    @staticmethod
+    def _original_quote(con, table: str, server_id: int) -> dict | None:
+        """嵌套引用：refermsg 里带的那份内容解析不出来时，按 svrid 回会话表里找那条引用消息自己"""
+        row = con.execute(f"select message_content from {table} where server_id = ? and local_type = ?",
+                          (server_id, 49 | (57 << 32))).fetchone()
+        return parse_quote(GROUP_PREFIX.sub("", decode_content(row[0]), count=1), 1) if row else None
 
     @staticmethod
     def _original_record(con, table: str, server_id: int) -> dict | None:
