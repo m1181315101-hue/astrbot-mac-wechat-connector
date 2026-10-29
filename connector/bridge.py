@@ -45,7 +45,7 @@ import webui  # noqa: E402
 import wxdb  # noqa: E402
 import wximg  # noqa: E402
 
-VERSION = "0.9.1"
+VERSION = "0.9.2"
 HERE = os.path.dirname(os.path.abspath(__file__))
 # 界面驱动的这些失败都发生在回车之前（回车前核对失败时已经清空输入框），一个字都没发出去，可以重试
 # 发图片后回查数据库确认用：PNG/JPG 存成图片 3，GIF 粘贴后存成动画表情附件 (49, 8)，有时是表情 47
@@ -403,7 +403,7 @@ class Connector:
         self.counts[f"{where}·{label if image else '聊天记录' if forward else '文字'}"] += 1
         mid = onebot.stable_id(f"{chat}:{m['local_id']}:{m['time']}")
         quote = m.get("quote")
-        reply_id = self.remember_quote(chat, quote) if quote else None
+        reply_id = await self.remember_quote(chat, quote) if quote else None
         quote_note = ("，引用了小号的话" if quote["sender"] == self.store.self_wxid else "，引用了一条消息") if quote else ""
         if chat.endswith("@chatroom"):
             sender = m["sender"] or "unknown"
@@ -432,8 +432,9 @@ class Connector:
         if not self.cfg["receive_only"]:
             await self.ob.push(event)
 
-    async def photo_image(self, chat: str, m: dict) -> dict | None:
-        """照片 → image 段要的 {file: base64://…}。原图（或高清）还没下载完就等一会儿，等不到用缩略图"""
+    async def photo_image(self, chat: str, m: dict, wait: bool = True, data_url: bool = False) -> dict | None:
+        """照片 → image 段要的 {file: 文件名, url: 下载地址}。原图（或高清）还没下载完就等一会儿（wait），等不到用缩略图。
+        data_url：再带一份 data:image/…;base64（给引用里的图片用，见 remember_quote）"""
         if not m.get("photo"):
             log.info("跳过 %s 的照片（消息里没有文件名）", self.state.id_of(chat))
             return None
@@ -443,7 +444,7 @@ class Connector:
             log.info("图片密钥：%s", "已从 kvcomm 推出并核对" if self.image_key else "推不出来，照片先跳过（10 分钟后再试）")
         if self.image_key is None:
             return None
-        deadline = time.time() + self.cfg["photo_wait_seconds"]
+        deadline = time.time() + (self.cfg["photo_wait_seconds"] if wait else 0)
         while True:
             paths = await asyncio.to_thread(self.store.photo_files, chat, int(m["time"]), m["photo"])
             if (paths and not paths[0].endswith("_t.dat")) or time.time() >= deadline:
@@ -460,13 +461,14 @@ class Connector:
                 kind = "缩略图" if path.endswith("_t.dat") else "高清图" if path.endswith("_h.dat") else "原图"
                 log.info("照片解开了（%s，%d KB）", kind, len(data) // 1024)
                 ext = media.image_ext(data)
+                extra = {"data_url": f"data:image/{ext.replace('jpg', 'jpeg')};base64," + base64.b64encode(data).decode()} if data_url else {}
                 if not self.cfg["photo_port"]:
-                    return {"file": "base64://" + base64.b64encode(data).decode(), "url": ""}
+                    return {"file": "base64://" + base64.b64encode(data).decode(), "url": "", **extra}
                 token = secrets.token_urlsafe(16)
                 self.photo_cache[token] = (data, time.time() + 900)
                 while len(self.photo_cache) > 100 or (self.photo_cache and next(iter(self.photo_cache.values()))[1] < time.time()):
                     self.photo_cache.popitem(last=False)
-                return {"file": f"{m['photo']}.{ext}", "url": f"{self.cfg['photo_url_base'].rstrip('/')}/p/{token}.{ext}"}
+                return {"file": f"{m['photo']}.{ext}", "url": f"{self.cfg['photo_url_base'].rstrip('/')}/p/{token}.{ext}", **extra}
         log.info("跳过 %s 的照片（%s）", self.state.id_of(chat), "文件解不开" if paths else "文件还没下载")
         return None
 
@@ -527,9 +529,11 @@ class Connector:
                 self.stickers.popitem(last=False)
         return image
 
-    def remember_quote(self, chat: str, quote: dict) -> int:
+    async def remember_quote(self, chat: str, quote: dict) -> int:
         """把被引用的那条做成一条消息记下来（最多 200 条），返回它的消息 ID；
-        原作者是小号时 user_id 用小号自己的 ID，AstrBot 才知道引用的是它"""
+        原作者是小号时 user_id 用小号自己的 ID，AstrBot 才知道引用的是它。
+        引用的是照片、表情包时带上图片段：AstrBot 按 url 取图；陪伴插件读引用里的图只肯下公网地址，
+        所以再带一份 data_url（data:image/…;base64），它认这种"""
         rid = onebot.stable_id(f"{chat}:quote:{quote['svrid'] or quote['text']}")
         author = quote["sender"] or chat
         if author == self.store.self_wxid:
@@ -539,12 +543,27 @@ class Connector:
         ts = quote["time"] or int(time.time())
         # 引用的是聊天记录：被引用的那条做成合并转发，标题已经在「[对话记录] 标题」里
         forward = self.remember_record(chat, quote["record"], f"quote:{rid}") if quote.get("record") else None
-        text = "" if forward else quote["text"]
+        image = None
+        if quote.get("photo"):
+            image = await self.photo_image(chat, {"photo": quote["photo"], "time": quote["photo_time"]},
+                                           wait=False, data_url=True)
+        elif quote.get("sticker"):
+            image = await self.sticker_image(quote["sticker"])
+            if image:
+                try:
+                    data = await asyncio.to_thread(media.fetch_sticker, quote["sticker"]["url"], quote["sticker"]["md5"],
+                                                   self.cfg["max_sticker_kb"] * 1024)
+                except Exception:
+                    data = None
+                if data:
+                    ext = media.image_ext(data).replace("jpg", "jpeg")
+                    image = {**image, "data_url": f"data:image/{ext};base64," + base64.b64encode(data).decode()}
+        text = "" if forward or image else quote["text"]
         if chat.endswith("@chatroom"):
             msg = onebot.group_message_event(self.self_id, self.state.id_of(chat), uid, name, rid,
-                                             text, False, ts, forward=forward)
+                                             text, False, ts, image=image, forward=forward)
         else:
-            msg = onebot.private_message_event(self.self_id, uid, name, rid, text, ts, forward=forward)
+            msg = onebot.private_message_event(self.self_id, uid, name, rid, text, ts, image=image, forward=forward)
         msg.pop("post_type")
         self.quoted[rid] = msg
         self.quoted.move_to_end(rid)

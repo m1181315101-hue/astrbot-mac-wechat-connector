@@ -292,7 +292,8 @@ def parse_quote(xml_text: str) -> dict | None:
     return {"title": appmsg.findtext("title") or "",
             "sender": (ref.findtext("chatusr") or ref.findtext("fromusr") or "").strip(),
             "name": ref.findtext("displayname") or "", "svrid": (ref.findtext("svrid") or "").strip(),
-            "time": int((ref.findtext("createtime") or "0").strip() or 0), "text": quoted, "record": record}
+            "time": int((ref.findtext("createtime") or "0").strip() or 0), "text": quoted, "record": record,
+            "type": rtype}
 
 
 def parse_record(xml_text: str) -> dict | None:
@@ -471,6 +472,8 @@ class WeChatStore:
                         base_type, text = 1, quote.pop("title")
                         if quote["record"] is not None and not quote["record"]["items"] and quote["svrid"].isdigit():
                             quote["record"] = self._original_record(con, table, int(quote["svrid"])) or quote["record"]
+                        if quote["type"] in (3, 47) and quote["svrid"].isdigit():
+                            self._quoted_media(con, table, int(quote["svrid"]), quote)
                 elif base_type == 47:
                     sticker, text = parse_sticker(text), ""
                 elif is_record:
@@ -497,6 +500,22 @@ class WeChatStore:
                     out.append(path)
                     break
         return out
+
+    @staticmethod
+    def _quoted_media(con, table: str, server_id: int, quote: dict) -> None:
+        """引用的是照片、表情包：按 svrid 回会话表里找原消息，照片带上文件名和时间（photo、photo_time），
+        表情包带上下载地址（sticker）；找不到（比如在别的分库里）就还是占位"""
+        row = con.execute(f"select local_type, create_time, message_content, packed_info_data from {table} "
+                          f"where server_id = ?", (server_id,)).fetchone()
+        if not row:
+            return
+        base, ct, content, packed = row[0] & 0xFFFFFFFF, row[1], row[2], row[3]
+        if base == 3:
+            found = re.search(rb"[0-9a-f]{32}", packed or b"")
+            if found:
+                quote["photo"], quote["photo_time"] = found.group().decode(), ct
+        elif base == 47:
+            quote["sticker"] = parse_sticker(GROUP_PREFIX.sub("", decode_content(content), count=1))
 
     @staticmethod
     def _original_record(con, table: str, server_id: int) -> dict | None:
