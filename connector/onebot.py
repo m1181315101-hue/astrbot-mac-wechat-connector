@@ -196,3 +196,11 @@ def group_message_event(self_id: int, group_id: int, user_id: int, nickname: str
         "message": message, "raw_message": raw, "message_format": "array",
         "sender": {"user_id": user_id, "nickname": nickname, "card": nickname, "role": "member"},
     }
+
+
+def group_increase_event(self_id: int, group_id: int, user_id: int, operator_id: int, nickname: str, ts: int) -> dict:
+    """有人进群：和 NapCat 的 group_increase 通知一样（邀请进来的 sub_type 是 invite，扫码、链接进来的是 approve）。
+    多带一个 nickname（OneBot 里没有这个字段）：新人多半不在通讯录里，插件想叫他的名字不用再查"""
+    return {"time": ts, "self_id": self_id, "post_type": "notice", "notice_type": "group_increase",
+            "sub_type": "invite" if operator_id else "approve", "group_id": group_id, "user_id": user_id,
+            "operator_id": operator_id, "nickname": nickname}

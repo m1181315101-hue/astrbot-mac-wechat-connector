@@ -8,6 +8,7 @@
         原图还没下载完时等几秒，等不到就用缩略图
     聊天记录（别人转发的多条消息）：和 NapCat 的合并转发一样给一个 forward 段，AstrBot 和插件用 get_forward_msg 取各条内容
     群里有人 @ 小号时，事件前面加一个 at 段，AstrBot 按「被 @」处理
+    有人进群：群里的入群提示转成和 NapCat 一样的 group_increase 通知（带新人昵称），欢迎类插件就能用
     引用回复：事件前面加一个 reply 段，被引用的那条记在内存里，AstrBot 用 get_msg 来取；
     引用的是小号的话，AstrBot 当成在叫它（和 QQ 上回复机器人的消息一样）
 回：AstrBot 的 send_private_msg / send_group_msg → 发送队列 → 界面驱动（wxui）切换会话、核对、粘贴、回车
@@ -45,7 +46,7 @@ import webui  # noqa: E402
 import wxdb  # noqa: E402
 import wximg  # noqa: E402
 
-VERSION = "0.10.0"
+VERSION = "0.11.0"
 HERE = os.path.dirname(os.path.abspath(__file__))
 # 界面驱动的这些失败都发生在回车之前（回车前核对失败时已经清空输入框），一个字都没发出去，可以重试
 # 发图片后回查数据库确认用：PNG/JPG 存成图片 3，GIF 粘贴后存成动画表情附件 (49, 8)，有时是表情 47
@@ -298,6 +299,7 @@ class Connector:
         self.image_key = None      # (AES 密钥, 异或字节)：第一次收到照片时推，推不出 10 分钟后再试
         self.image_key_tried = 0.0
         self.photo_cache: OrderedDict[str, tuple[bytes, float]] = OrderedDict()  # 下载地址里的随机名 → (图片, 过期时间)
+        self.member_names: OrderedDict[str, str] = OrderedDict()  # 入群提示里的新人昵称：多半不在通讯录里，@ 他时要用
         # 给状态页看的：启动时间、收发计数、最近一次数据库有变化的时间、密钥出错的原因、最近几次发送的结果
         self.version = VERSION
         self.started = time.time()
@@ -392,12 +394,15 @@ class Connector:
             if not image:
                 log.info("跳过 %s 的表情包（拿不到原图）", cid)
                 return
+        elif m.get("joined"):
+            await self.deliver_join(chat, m)
+            return
         elif m.get("record"):
             if not self.cfg["receive_records"]:
                 return
             forward = self.remember_record(chat, m["record"], f"{m['local_id']}:{m['time']}")
         elif m["type"] != 1 or not m["text"]:
-            if m["type"] != 10000:  # 10000 是「某某撤回了一条消息」这类系统提示
+            if m["type"] != 10000:  # 10000 是「某某撤回了一条消息」这类系统提示（入群提示在上面单独处理）
                 log.info("跳过 %s 的非文字消息 type=%s（只收文字、引用和表情包）", cid, m["type"])
                 self.counts["跳过·" + SKIPPED_TYPES.get(m["type"], f"type {m['type']}")] += 1
             return
@@ -432,6 +437,31 @@ class Connector:
                                                  m["text"], int(m["time"]), reply_id, image, forward)
         if not self.cfg["receive_only"]:
             await self.ob.push(event)
+
+    async def deliver_join(self, chat: str, m: dict) -> None:
+        """入群提示 → 每个新人一条 group_increase 通知；小号自己不算"""
+        cid = self.state.id_of(chat)
+        inviter = m["joined"]["inviter"]
+        members = [(w, n) for w, n in m["joined"]["members"] if w != self.store.self_wxid]
+        for wxid, nick in members:
+            if nick:
+                self.member_names[wxid] = nick
+                self.member_names.move_to_end(wxid)
+            while len(self.member_names) > 500:
+                self.member_names.popitem(last=False)
+            event = onebot.group_increase_event(self.self_id, cid, self.state.id_of(wxid),
+                                                self.state.id_of(inviter) if inviter else 0,
+                                                nick or self.name_of(wxid), int(m["time"]))
+            if not self.cfg["receive_only"]:
+                await self.ob.push(event)
+        if members:
+            log.info("群 %s 进了 %d 个新人%s", cid, len(members), "（有人邀请）" if inviter else "")
+            self.counts["群·有人进群"] += len(members)
+
+    def name_of(self, wxid: str) -> str:
+        """备注名、昵称；通讯录里没有（比如刚进群的人）就用入群提示里的昵称"""
+        name = self.store.display_name(wxid)
+        return self.member_names.get(wxid, name) if name == wxid else name
 
     async def photo_image(self, chat: str, m: dict, wait: bool = True, data_url: bool = False) -> dict | None:
         """照片 → image 段要的 {file: 文件名, url: 下载地址}。原图（或高清）还没下载完就等一会儿（wait），等不到用缩略图。
@@ -608,7 +638,7 @@ class Connector:
         if action == "get_group_member_info":
             uid = str(params.get("user_id"))
             wxid = self.state.ids.get(uid)
-            nick = "微信" if uid == str(self.self_id) else (self.store.display_name(wxid) if wxid else uid)
+            nick = "微信" if uid == str(self.self_id) else (self.name_of(wxid) if wxid else uid)
             return "ok", 0, {"group_id": params.get("group_id"), "user_id": params.get("user_id"), "nickname": nick,
                              "card": nick, "role": "member"}
         if action == "get_group_member_list":
@@ -617,7 +647,7 @@ class Connector:
             return "ok", 0, {"user_id": self.self_id, "nickname": "微信"}
         if action == "get_stranger_info":
             wxid = self.state.ids.get(str(params.get("user_id")))
-            nick = self.store.display_name(wxid) if wxid else str(params.get("user_id"))
+            nick = self.name_of(wxid) if wxid else str(params.get("user_id"))
             return "ok", 0, {"user_id": params.get("user_id"), "nickname": nick, "sex": "unknown", "age": 0}
         if action in FORWARD_ACTIONS:
             group = FORWARD_ACTIONS[action]
@@ -656,7 +686,7 @@ class Connector:
 
     def _at_name(self, qq: str) -> str:
         wxid = self.state.ids.get(qq)
-        return self.store.display_name(wxid) if wxid else ""
+        return self.name_of(wxid) if wxid else ""
 
     async def send_to(self, target_id: str, params: dict, group: bool):
         """先排队再检查：检查要读库（会让出控制权），放在排队前面的话后到的消息可能插队。

@@ -355,6 +355,31 @@ def parse_sticker(xml_text: str) -> dict | None:
     return {"url": url, "md5": (emoji.get("md5") or "").strip().lower()}
 
 
+def parse_join(xml_text: str) -> dict | None:
+    """群里的入群提示（local_type 10000，sysmsgtemplate）：模板如「$username$邀请$names$加入了群聊」
+    「$adder$通过扫描$from$分享的二维码加入群聊」，link_list 里每个占位对应 memberlist（username 是 wxid）。
+    返回 {"members": [(wxid, 昵称)], "inviter": wxid}；小号自己被拉进群（「邀请你加入了群聊」）和别的系统提示返回 None"""
+    try:
+        root = ET.fromstring(xml_text.strip())
+    except ET.ParseError:
+        return None
+    tmpl = (root.findtext(".//content_template/template") or "").strip()
+    if "加入" not in tmpl or "你加入" in tmpl:
+        return None
+    links = {link.get("name"): [((m.findtext("username") or "").strip(), (m.findtext("nickname") or "").strip())
+                                for m in link.findall("./memberlist/member")]
+             for link in root.findall(".//link_list/link")}
+    keys = re.findall(r"\$(\w+)\$", tmpl)
+    if "邀请" in tmpl:  # 邀请人在「邀请」前面，新人在后面
+        head, tail = tmpl.split("邀请", 1)
+        inviter_keys, new_keys = re.findall(r"\$(\w+)\$", head), re.findall(r"\$(\w+)\$", tail.split("加入", 1)[0])
+    else:  # 扫码、链接：新人在最前面，后面的是分享人
+        inviter_keys, new_keys = keys[1:2], keys[:1]
+    members = [m for k in new_keys for m in links.get(k, []) if m[0]]
+    inviter = next((m[0] for k in inviter_keys for m in links.get(k, []) if m[0]), "")
+    return {"members": members, "inviter": inviter} if members else None
+
+
 SYSTEM_IDS = {"filehelper", "weixin", "fmessage", "medianote", "floatbottle", "newsapp",
               "notifymessage", "brandsessionholder", "qqmail", "tmessage", "qmessage"}
 
@@ -443,6 +468,7 @@ class WeChatStore:
         """marks：{库文件名: 已处理到的 local_id}，原地更新；返回对方发来的新消息（含非文字，type 区分）。
         引用回复当成文字（type 1，text 是新说的话），另带 quote：被引用的那条（见 parse_quote）。
         表情包（type 47）另带 sticker：下载地址和 md5（见 parse_sticker）。照片（type 3）另带 photo：加密文件的名字。
+        群里的入群提示（type 10000）另带 joined：新人和邀请人（见 parse_join）。
         调用方启动时先用 latest_ids 把已有会话的水位设到最新（不回放历史）；
         之后才出现的会话表（第一次聊天、新分库）不在 marks 里，从头读。"""
         table, out = self.table_of(wxid), []
@@ -485,13 +511,15 @@ class WeChatStore:
                     sticker, text = parse_sticker(text), ""
                 elif is_record:
                     record, text = parse_record(text), ""
-                photo = None
+                photo = joined = None
+                if base_type == 10000 and wxid.endswith("@chatroom"):
+                    joined = parse_join(GROUP_PREFIX.sub("", decode_content(content), count=1))
                 if base_type == 3:  # packed_info_data 里那串 32 位十六进制就是 .dat 的文件名
                     found = re.search(rb"[0-9a-f]{32}", packed or b"")
                     photo = found.group().decode() if found else None
                 out.append({"local_id": local_id, "server_id": server_id, "type": base_type, "time": create_time,
                             "sender": names.get(sender, ""), "text": text, "quote": quote, "sticker": sticker,
-                            "record": record, "photo": photo})
+                            "record": record, "photo": photo, "joined": joined})
         return out
 
     def photo_files(self, wxid: str, ts: int, name: str) -> list[str]:
