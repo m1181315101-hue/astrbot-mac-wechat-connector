@@ -12,5 +12,6 @@
   "voice_mode": "native",
   "receive_stickers": true,
   "group_stickers": true,
-  "receive_records": true
+  "receive_records": true,
+  "webui_port": 6299
 }

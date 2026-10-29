@@ -6,6 +6,7 @@ Linux 微信是 Qt 写的，带无障碍桥：打开 org.a11y.Status.IsEnabled �
 标准输入每行一个 JSON 请求，标准输出每行一个 JSON 结果：
 
   {"op": "ping"}
+  {"op": "status"}  → {"ok": true, "frame": true, "width": 880, "height": 640}（只读，不动窗口）
   {"op": "send", "name": "备注名", "text": "...", "sections": ["联系人"], "use_list": true, "delay": 1.2}
   {"op": "send", "name": "备注名", "file": "/tmp/xx/语音.mp3", "sections": ["群聊"], "use_list": true}
   {"op": "send", "name": "备注名", "voice": "/tmp/xx/voice.wav", "sections": ["联系人"], "use_list": true}
@@ -397,6 +398,10 @@ def main() -> None:
             op = req.get("op")
             if op == "ping":
                 resp = {"ok": show_main_window() and main_frame() is not None}
+            elif op == "status":  # 状态页用：只看不动（ping 会把窗口从托盘里拉出来、调大小）
+                frame = main_frame()
+                w, h = ext(frame)[2:] if frame is not None else (0, 0)
+                resp = {"ok": True, "frame": frame is not None, "width": w, "height": h}
             elif op == "send":
                 resp = handle_send(req)
             else:

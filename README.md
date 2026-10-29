@@ -45,6 +45,7 @@
 | `connector/onebot.py` | OneBot v11 反向 WebSocket 客户端，以及消息事件的格式 |
 | `connector/media.py` | 把 AstrBot 发来的图片、语音（base64）落成临时文件：WEBP 转 PNG；语音条用 wav（mp3 用 lame 解码，超过 55 秒切段），退回文件时用 lame 转 mp3；估算音频时长 |
 | `connector/bridge.py` | 主程序：轮询、白名单、发送队列、限速、确认 |
+| `connector/webui.py` | 只读状态页：微信进程和窗口、数据库密钥、AstrBot 连接、发送队列、收发计数、日志 |
 
 ## 环境要求
 
@@ -141,6 +142,7 @@ docker exec -u abc wechat /lsiopy/bin/python3 /opt/wechat-connector/bridge.py lo
 | `group_stickers` | 群里的表情包也收，默认 `true`。AstrBot 不会因为一张表情包就回话（除非被 @ 或引用），但陪伴类插件如果开着「群聊看图」，每张都会多调一次看图模型；想省就设成 `false`，只收私聊的 |
 | `max_sticker_kb` | 超过这么大的表情包不收，默认 5120（5MB） |
 | `receive_records` | 收别人转发的聊天记录，默认 `true`：消息里给一段「[对话记录] 标题」文字加一个 `forward` 段（标题去掉了「的聊天记录」，故意不写「聊天记录」「转发」这几个词：陪伴插件看到它们会先拿这个人上一份聊天记录），AstrBot 和插件用 `get_forward_msg` 取各条内容（格式和 NapCat 一样）；里面的图片、语音、视频换成「[图片]」这样的占位，链接、文件带标题，嵌套的聊天记录展开成缩进的文字 |
+| `webui_port` | 只读状态页的端口，默认 `6299`，`0` 是不开；`webui_host` 默认 `127.0.0.1`，只有容器里的 nginx 能访问，见第 6 步 |
 
 ### 4. AstrBot 里加一个平台
 
@@ -171,6 +173,20 @@ docker exec -u 0 wechat s6-svc -u /run/service/svc-wechat-connector
 
 日志在 `./data/wechat-connector/connector.log`，也可以看 `docker logs wechat`。
 
+### 6. 状态页
+
+浏览器打开 `https://localhost:3001/wxc/`，账号密码和网页桌面一样。页面每 5 秒刷新一次，能看到：
+
+- **微信进程和窗口**：窗口找不到，或者小得像登录窗口，多半是掉线了，点右上角「打开网页桌面」看是不是要重新扫码；
+- **数据库**：消息库能不能读（密钥失效会标红），以及最近一次有新数据是多久以前（超过 6 小时标黄）；
+- **AstrBot**：连着没有、连了多久、断开过几次；
+- **发送**：排队几条、最近 12 次发给谁（OneBot 号）、发了什么类型、成没成；有 `STOP` 文件时会提示；
+- **收发计数**（启动以来，按私聊、群和类型分）、主要配置、`connector.log` 最后 200 行。
+
+状态页只读：不改配置、不发消息，查窗口也不会动它（每 30 秒最多查一次，正在发消息时不查）。页面里没有消息内容、昵称和令牌。`/wxc/api/status` 返回同样内容的 JSON，可以拿来写掉线提醒。
+
+它由连接器在容器里的 `127.0.0.1:6299` 提供，镜像里改了网页桌面 nginx 的配置模板，把 `/wxc/` 转过去，所以沿用网页桌面的密码，不用另开端口。旧镜像建的容器要重新构建镜像、重建容器才有这个转发（作者遇到过重建后微信要重新扫码登录的情况，挑方便扫码的时候做）。
+
 ## 和 AstrBot 一起用的建议
 
 - **微信上的人在 AstrBot 里是一串数字。** 连接器把每个 wxid 换成一个固定的整数（OneBot 号，`bridge.py lookup` 能查），AstrBot 看到的「QQ 号」「群号」就是它。人格或插件里按 ID 认人的（比如「这个号是主人」），要把微信上的 OneBot 号也写进去。
@@ -192,6 +208,7 @@ docker exec -u 0 wechat s6-svc -u /run/service/svc-wechat-connector
 | 急停 | 在 `./data/wechat-connector/` 里放一个名为 `STOP` 的文件，就只收不发，删掉恢复 |
 | 发后确认 | 发完回查数据库，确认真的多了一条自己发出的消息 |
 | 隐私 | 日志只记 OneBot 号、时间和字数，不记内容；解密后的明文只在内存里，不写盘 |
+| 状态页 | 只在容器里监听，经网页桌面的 nginx（要密码）访问；只读，只支持 GET，不显示消息内容、昵称和令牌 |
 
 ## 已知限制
 

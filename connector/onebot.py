@@ -32,6 +32,9 @@ class OneBotClient:
         self.ws = None
         self.buffer: deque[tuple[float, dict]] = deque(maxlen=50)  # AstrBot 重启期间先攒着
         self.buffer_seconds = buffer_seconds
+        self.connected_at = 0.0  # 给状态页看：这次连上的时间、断开过几次、最近一次断开的原因
+        self.disconnects = 0
+        self.last_error = ""
 
     async def push(self, event: dict) -> None:
         if self.ws is not None:
@@ -81,6 +84,7 @@ class OneBotClient:
             try:
                 async with websockets.connect(self.url, additional_headers=headers, max_size=32 * 1024 * 1024) as ws:
                     self.ws = ws
+                    self.connected_at = time.time()
                     log.info("已连上 AstrBot：%s", self.url)
                     await ws.send(json.dumps(self.meta("lifecycle", sub_type="connect")))
                     await self._flush()
@@ -97,6 +101,9 @@ class OneBotClient:
                         hb.cancel()
             except (OSError, websockets.WebSocketException) as e:
                 log.warning("连接 AstrBot 失败或断开（%s），5 秒后重连", type(e).__name__)
+                self.last_error = type(e).__name__
+            if self.ws is not None:
+                self.disconnects += 1
             self.ws = None
             await asyncio.sleep(5)
 

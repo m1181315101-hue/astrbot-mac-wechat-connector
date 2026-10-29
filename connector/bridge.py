@@ -11,6 +11,7 @@
     → 回查数据库确认。文字、图片（GIF 是动画表情）、语音（原生语音条，不行就退回 mp3 文件）按原顺序一段一段发
     界面只有一个：所有要发的消息按到达顺序排成一队，一条（含它的所有段）发完再发下一条；
     界面没动过、一个字没发出去的失败（核对没过、没找到搜索框）等 2 秒重试一次
+状态页：容器里 127.0.0.1:6299 上的只读网页（webui.py），nginx 把网页桌面的 /wxc/ 转过来
 
 用法（在微信容器里，用和微信相同的用户运行）：
   python3 bridge.py run    [--config /config/wechat-connector/config.json]
@@ -30,18 +31,21 @@ import subprocess
 import sys
 import threading
 import time
-from collections import OrderedDict, deque
+from collections import Counter, OrderedDict, deque
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 import media  # noqa: E402
 import onebot  # noqa: E402
+import webui  # noqa: E402
 import wxdb  # noqa: E402
 
-VERSION = "0.7.1"
+VERSION = "0.8.0"
 HERE = os.path.dirname(os.path.abspath(__file__))
 # 界面驱动的这些失败都发生在回车之前（回车前核对失败时已经清空输入框），一个字都没发出去，可以重试
 # 发图片后回查数据库确认用：PNG/JPG 存成图片 3，GIF 粘贴后存成动画表情附件 (49, 8)，有时是表情 47
 IMAGE_TYPES = (3, 47, (49, 8))
+# 状态页里「跳过」计数的名字（没列出的显示成 type N）
+SKIPPED_TYPES = {3: "图片", 34: "语音", 42: "名片", 43: "视频", 48: "位置", 49: "链接/文件/小程序", 50: "通话"}
 RETRYABLE = ("粘贴前核对失败", "回车前核对失败", "没找到搜索框", "打开后输入框名字对不上", "找不到微信主窗口")
 log = logging.getLogger("wechat-connector")
 
@@ -69,6 +73,8 @@ DEFAULTS = {
     "receive_records": True,    # 收别人转发的聊天记录，按合并转发交给 AstrBot（里面的图片、语音换成占位）
     "max_text_chars": 1500,     # 一条文字超过这么多字就按换行拆成几条发
     "max_queue_wait": 150,  # 排队超过这么多秒还没轮到就不发了（AstrBot 等回执最多 180 秒，超时后插件可能已经改发文字）
+    "webui_host": "127.0.0.1",  # 只读状态页，容器里的 nginx 把 /wxc/ 转过来（沿用网页桌面的密码）
+    "webui_port": 6299,         # 0 = 不开
 }
 
 
@@ -274,6 +280,13 @@ class Connector:
         self.stickers: OrderedDict[str, dict] = OrderedDict()  # md5 → 已核对过的 {file, url}，同一个表情包不重复下载
         self.records: OrderedDict[str, dict] = OrderedDict()  # 收到的聊天记录，forward id → 内容，给 get_forward_msg 用
         self.media = media.MediaDir(cfg["media_dir"])
+        # 给状态页看的：启动时间、收发计数、最近一次数据库有变化的时间、密钥出错的原因、最近几次发送的结果
+        self.version = VERSION
+        self.started = time.time()
+        self.counts: Counter = Counter()
+        self.last_change = 0.0
+        self.key_error = ""
+        self.recent_sends: deque[dict] = deque(maxlen=30)
         self.face_names = {}
         if cfg.get("face_map"):
             with open(cfg["face_map"], encoding="utf-8") as f:
@@ -308,13 +321,17 @@ class Connector:
         while True:
             await asyncio.sleep(self.cfg["poll_interval"])
             try:
-                if not await self._refresh():
-                    continue
+                changed = await self._refresh()
             except LookupError as e:
+                self.key_error = str(e)
                 if not warned:
                     log.error("%s：重新抓一次密钥（README 第 3 步）", e)
                     warned = True
                 continue
+            self.key_error = ""
+            if not changed:
+                continue
+            self.last_change = time.time()
             changed = False
             async with self.db_lock:
                 targets = await asyncio.to_thread(self.private_targets)
@@ -335,9 +352,11 @@ class Connector:
     async def deliver(self, chat: str, m: dict) -> None:
         """chat：私聊是对方 wxid，群是 xxx@chatroom；m["sender"] 是实际发言人的 wxid"""
         cid = self.state.id_of(chat)
+        where = "群" if chat.endswith("@chatroom") else "私聊"
         age = time.time() - (m["time"] or 0)
         if age > self.cfg["max_message_age"]:
             log.info("跳过 %s 的旧消息（%d 秒前）", cid, age)
+            self.counts["跳过·旧消息"] += 1
             return
         image = forward = None
         if m["type"] == 47:
@@ -354,7 +373,9 @@ class Connector:
         elif m["type"] != 1 or not m["text"]:
             if m["type"] != 10000:  # 10000 是「某某撤回了一条消息」这类系统提示
                 log.info("跳过 %s 的非文字消息 type=%s（只收文字、引用和表情包）", cid, m["type"])
+                self.counts["跳过·" + SKIPPED_TYPES.get(m["type"], f"type {m['type']}")] += 1
             return
+        self.counts[f"{where}·{'表情包' if image else '聊天记录' if forward else '文字'}"] += 1
         mid = onebot.stable_id(f"{chat}:{m['local_id']}:{m['time']}")
         quote = m.get("quote")
         reply_id = self.remember_quote(chat, quote) if quote else None
@@ -646,6 +667,9 @@ class Connector:
             await asyncio.sleep(2.0)
             resp = await asyncio.to_thread(self.ui.request, req, 40.0 + seconds)
         what = f"{len(text)} 字" if text else (f"语音条 {seconds:.0f} 秒" if voice else os.path.basename(file))
+        self.recent_sends.append({"time": time.time(), "to": label, "what": what, "ok": bool(resp.get("ok")),
+                                  "reason": "" if resp.get("ok") else str(resp.get("reason", ""))[:80]})
+        self.counts["发出" if resp.get("ok") else "发送失败"] += 1
         if not resp.get("ok"):
             log.warning("发给 %s 失败（%s）：%s", label, what, resp.get("reason"))
             return False, f"发送失败：{resp.get('reason')}"
@@ -675,6 +699,8 @@ class Connector:
         ping = await asyncio.to_thread(self.ui.request, {"op": "ping"}, 20.0)
         log.info("界面驱动：%s", "就绪" if ping.get("ok") else "没找到微信主窗口（检查无障碍组件）")
         tasks = [asyncio.create_task(self.poll_loop())]
+        if self.cfg["webui_port"]:
+            tasks.append(asyncio.create_task(webui.serve(self, self.cfg["webui_host"], int(self.cfg["webui_port"]))))
         if not self.cfg["receive_only"]:
             tasks.append(asyncio.create_task(self.send_worker()))
             tasks.append(asyncio.create_task(self.ob.run_forever()))

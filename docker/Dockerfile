@@ -13,6 +13,11 @@ RUN apt-get update \
 ENV PULSE_SERVER=unix:/defaults/native \
     QT_LINUX_ACCESSIBILITY_ALWAYS_ON=1
 
+# 状态页：网页桌面（nginx）的 /wxc/ 转给连接器在容器里开的 127.0.0.1:6299，沿用网页桌面的密码。
+# 改的是模板，nginx 每次启动都从它生成配置；两个 server 块（3000、3001）各插一条，插不进去就让构建失败
+RUN sed -i 's|^  location SUBFOLDER {$|  location = SUBFOLDERwxc { return 301 SUBFOLDERwxc/; }\n  location SUBFOLDERwxc/ {\n    proxy_pass http://127.0.0.1:6299/;\n  }\n&|' /defaults/default.conf \
+ && test "$(grep -c 'proxy_pass http://127.0.0.1:6299/' /defaults/default.conf)" = 2
+
 COPY connector/ /opt/wechat-connector/
 # init-wxvmic：PulseAudio 之后、桌面之前建虚拟麦克风；svc-wechat-connector：微信起来后启动连接器
 COPY docker/root/ /
