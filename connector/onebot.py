@@ -9,6 +9,7 @@ import asyncio
 import hashlib
 import json
 import logging
+import re
 import time
 from collections import deque
 
@@ -115,12 +116,25 @@ def _image_seg(image: dict | None) -> tuple[list[dict], str]:
     return [{"type": "image", "data": {"file": image["file"], "url": image["url"]}}], "[图片]"
 
 
+# 陪伴插件（astrbot_plugin_private_companion）看到消息文字里有这几个词，会先拿这个人最近一次的聊天记录，
+# 连着转两份时第二份就读成了第一份；给模型看的标签里避开它们，插件才会按这条消息自己的 forward 段去取
+_LATEST_HINTS = ("转发", "合并消息", "聊天记录")
+
+
+def record_label(title: str) -> str:
+    """「[对话记录] 小红和小明」：微信的标题多是「…的聊天记录」，去掉这个尾巴；剩下的还带那几个词就不写标题"""
+    short = re.sub(r"的?聊天记录$", "", title or "").strip()
+    if any(w in short for w in _LATEST_HINTS):
+        short = ""
+    return f"[对话记录] {short}".strip()
+
+
 def _forward_seg(forward: dict | None) -> tuple[list[dict], str]:
-    """收到的聊天记录：一段文字「[聊天记录] 标题」加一个 forward 段（和 NapCat 一样只带 id），内容用 get_forward_msg 取。
+    """收到的聊天记录：一段文字「[对话记录] 标题」加一个 forward 段（和 NapCat 一样只带 id），内容用 get_forward_msg 取。
     要带那段文字：消息里只有 forward 段时 AstrBot 当成空消息，不交给模型"""
     if not forward:
         return [], ""
-    label = f"[聊天记录] {forward['title']}"
+    label = record_label(forward["title"])
     return ([{"type": "text", "data": {"text": label}}, {"type": "forward", "data": {"id": forward["id"]}}],
             f"{label}[CQ:forward,id={forward['id']}]")
 

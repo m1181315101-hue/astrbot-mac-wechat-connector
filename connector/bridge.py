@@ -37,7 +37,7 @@ import media  # noqa: E402
 import onebot  # noqa: E402
 import wxdb  # noqa: E402
 
-VERSION = "0.7.0"
+VERSION = "0.7.1"
 HERE = os.path.dirname(os.path.abspath(__file__))
 # 界面驱动的这些失败都发生在回车之前（回车前核对失败时已经清空输入框），一个字都没发出去，可以重试
 # 发图片后回查数据库确认用：PNG/JPG 存成图片 3，GIF 粘贴后存成动画表情附件 (49, 8)，有时是表情 47
@@ -420,7 +420,7 @@ class Connector:
         else:
             uid, name = self.state.id_of(author), quote["name"] or self.store.display_name(author)
         ts = quote["time"] or int(time.time())
-        # 引用的是聊天记录：被引用的那条做成合并转发，标题已经在「[聊天记录] 标题」里
+        # 引用的是聊天记录：被引用的那条做成合并转发，标题已经在「[对话记录] 标题」里
         forward = self.remember_record(chat, quote["record"], f"quote:{rid}") if quote.get("record") else None
         text = "" if forward else quote["text"]
         if chat.endswith("@chatroom"):
