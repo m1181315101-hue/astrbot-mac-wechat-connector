@@ -14,7 +14,7 @@
     → 回查数据库确认。文字、图片（GIF 是动画表情）、语音（原生语音条，不行就退回 mp3 文件）按原顺序一段一段发
     界面只有一个：所有要发的消息按到达顺序排成一队，一条（含它的所有段）发完再发下一条；
     界面没动过、一个字没发出去的失败（核对没过、没找到搜索框）等 2 秒重试一次
-状态页：容器里 127.0.0.1:6299 上的只读网页（webui.py），nginx 把网页桌面的 /wxc/ 转过来
+状态页：容器里 127.0.0.1:6299 上的网页（webui.py），nginx 把网页桌面的 /wxc/ 转过来：看状态、暂停发送、改常用设置
 
 用法（在微信容器里，用和微信相同的用户运行）：
   python3 bridge.py run    [--config /config/wechat-connector/config.json]
@@ -45,7 +45,7 @@ import webui  # noqa: E402
 import wxdb  # noqa: E402
 import wximg  # noqa: E402
 
-VERSION = "0.9.3"
+VERSION = "0.10.0"
 HERE = os.path.dirname(os.path.abspath(__file__))
 # 界面驱动的这些失败都发生在回车之前（回车前核对失败时已经清空输入框），一个字都没发出去，可以重试
 # 发图片后回查数据库确认用：PNG/JPG 存成图片 3，GIF 粘贴后存成动画表情附件 (49, 8)，有时是表情 47
@@ -98,6 +98,7 @@ def load_config(path: str) -> dict:
         cfg.update(json.load(f))
     for key in ("whitelist", "group_whitelist", "bot_names"):
         cfg[key] = [str(w).strip() for w in cfg[key] if str(w).strip()]
+    cfg["_config_path"] = path  # 状态页保存设置时写回这个文件
     return cfg
 
 
