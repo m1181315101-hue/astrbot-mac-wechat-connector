@@ -3,9 +3,10 @@
 #   docker build -f docker/Dockerfile -t wechat-connector .
 FROM nickrunning/wechat-selkies:0.0.17-minimal
 
-# gdb：扫码时抓数据库密钥；xdotool/xclip：点击和粘贴；at-spi：读微信界面；lame：mp3 编解码
+# gdb：扫码时抓数据库密钥；xdotool/xclip：点击和粘贴；at-spi：读微信界面；lame：mp3 编解码；
+# ffmpeg：把微信 wxgf 格式（HEVC）的照片原图转成 JPEG
 RUN apt-get update \
- && apt-get install -y --no-install-recommends gdb xdotool xclip at-spi2-core gir1.2-atspi-2.0 lame \
+ && apt-get install -y --no-install-recommends gdb xdotool xclip at-spi2-core gir1.2-atspi-2.0 lame ffmpeg \
  && rm -rf /var/lib/apt/lists/*
 
 # 镜像只给微信 PULSE_RUNTIME_PATH=/defaults，PulseAudio 要求这个目录归自己所有，微信就连不上声音服务

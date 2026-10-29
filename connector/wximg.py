@@ -16,13 +16,15 @@ import hashlib
 import io
 import os
 import re
+import shutil
 import struct
+import subprocess
 
 from cryptography.hazmat.primitives.ciphers import Cipher, algorithms, modes
 
 V2 = b"\x07\x08V2\x08\x07"
 MAGIC = (b"\xff\xd8\xff", b"\x89PNG", b"GIF8", b"RIFF", b"BM")
-WXGF = b"wxgf"  # 微信自家的压缩格式（里面是 HEVC），密钥对也能解出这个头，但 AstrBot 认不了，这种就换缩略图
+WXGF = b"wxgf"  # 微信自家的压缩格式，里面是 HEVC 编码的一帧；AstrBot 认不了，用 ffmpeg 转成 JPEG（见 to_image）
 
 
 def _head_ok(key: bytes, data: bytes) -> bool:
@@ -58,7 +60,7 @@ def find_key(kvcomm_dir: str, acct_dir: str, samples: int = 5) -> tuple[bytes, i
 
 
 def decrypt(data: bytes, key: bytes, xor: int) -> bytes | None:
-    """V2 的 .dat → 图片原始字节；格式不对、解出来不是 AstrBot 认得的图片（比如 wxgf）返回 None"""
+    """V2 的 .dat → 解密后的字节（普通图片或 wxgf）；格式不对、解不开返回 None"""
     if data[:6] != V2 or len(data) < 15:
         return None
     aes_size, xor_size = struct.unpack_from("<II", data, 6)
@@ -74,7 +76,54 @@ def decrypt(data: bytes, key: bytes, xor: int) -> bytes | None:
     rest = payload[aligned:]
     cut = len(rest) - xor_size
     out = head[:-pad] + rest[:cut] + rest[cut:].translate(bytes(i ^ xor for i in range(256)))
-    return out if out.startswith(MAGIC) else None
+    return out if out.startswith(MAGIC + (WXGF,)) else None
+
+
+def _nal_units(data: bytes) -> list[bytes]:
+    """wxgf 里按起始码（00 00 01 / 00 00 00 01）切出 HEVC 的各个 NAL 单元（去掉起始码）"""
+    starts, i = [], 4
+    while (i := data.find(b"\x00\x00\x01", i)) != -1:
+        starts.append(i + 3)
+        i += 3
+    units = []
+    for k, start in enumerate(starts):
+        end = starts[k + 1] - 3 if k + 1 < len(starts) else len(data)
+        unit = data[start:end].rstrip(b"\x00") if k + 1 < len(starts) else data[start:end]
+        if len(unit) >= 2 and not unit[0] & 0x80:
+            units.append(unit)
+    return units
+
+
+def to_image(data: bytes) -> bytes | None:
+    """wxgf → JPEG（要有 ffmpeg），普通图片原样返回；转不出来返回 None。
+    做法参考 WeFlow 的 unwrapWxgf：按 VPS（类型 32）分组，挑最大的带画面数据的一组，不行再整段试"""
+    if not data.startswith(WXGF):
+        return data
+    if not shutil.which("ffmpeg"):
+        return None
+    units = _nal_units(data)
+    groups, cur = [], None
+    for u in units:
+        if (u[0] >> 1) & 0x3F == 32:
+            cur = []
+            groups.append(cur)
+        if cur is not None:
+            cur.append(u)
+    joined = lambda us: b"".join(b"\x00\x00\x00\x01" + u for u in us)
+    tries = [joined(g) for g in sorted((g for g in groups if any((u[0] >> 1) & 0x3F < 32 for u in g)), key=len, reverse=True)]
+    tries += [joined(units), data[4:]]
+    for stream in tries:
+        if len(stream) < 100:
+            continue
+        try:
+            out = subprocess.run(["ffmpeg", "-loglevel", "error", "-f", "hevc", "-i", "pipe:0", "-frames:v", "1",
+                                  "-f", "image2", "-c:v", "mjpeg", "-q:v", "3", "pipe:1"],
+                                 input=stream, capture_output=True, timeout=30).stdout
+        except (OSError, subprocess.TimeoutExpired):
+            continue
+        if out.startswith(b"\xff\xd8\xff") and len(out) > 1000:
+            return out
+    return None
 
 
 def shrink(data: bytes, max_side: int = 1600, max_bytes: int = 1536 * 1024) -> bytes:

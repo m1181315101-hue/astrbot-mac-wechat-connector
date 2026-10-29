@@ -3,7 +3,8 @@
 
 收：轮询本地数据库（wxdb），白名单里的人（私聊；写 "*" 就是所有好友）和白名单里的群发来的新文字 → OneBot 消息事件 → AstrBot
     表情包：按消息里的 cdnurl 下载原图核对（md5、格式、大小），合格的以 image 段（文件名 + 原图地址，和 NapCat 一样）交给 AstrBot
-    照片：解开微信加密存的 .dat（wximg，密钥从本机 kvcomm 推出来），太大的缩小，以 base64 的 image 段交给 AstrBot；
+    照片：解开微信加密存的 .dat（wximg，密钥从本机 kvcomm 推出来），wxgf 原图用 ffmpeg 转成 JPEG，太大的缩小；
+        和表情包一样以 image 段（文件名 + 下载地址）交给 AstrBot，下载地址由连接器在容器网络里临时提供（15 分钟）；
         原图还没下载完时等几秒，等不到就用缩略图
     聊天记录（别人转发的多条消息）：和 NapCat 的合并转发一样给一个 forward 段，AstrBot 和插件用 get_forward_msg 取各条内容
     群里有人 @ 小号时，事件前面加一个 at 段，AstrBot 按「被 @」处理
@@ -29,6 +30,7 @@ import logging
 import logging.handlers
 import os
 import re
+import secrets
 import select
 import subprocess
 import sys
@@ -43,7 +45,7 @@ import webui  # noqa: E402
 import wxdb  # noqa: E402
 import wximg  # noqa: E402
 
-VERSION = "0.9.0"
+VERSION = "0.9.1"
 HERE = os.path.dirname(os.path.abspath(__file__))
 # 界面驱动的这些失败都发生在回车之前（回车前核对失败时已经清空输入框），一个字都没发出去，可以重试
 # 发图片后回查数据库确认用：PNG/JPG 存成图片 3，GIF 粘贴后存成动画表情附件 (49, 8)，有时是表情 47
@@ -78,6 +80,10 @@ DEFAULTS = {
     "group_photos": True,       # 群里的照片也收（和群表情包一样，陪伴类插件每张会多一次看图调用）
     "photo_wait_seconds": 3,    # 原图还没下载完时最多等这么久，等不到就用缩略图
     "kvcomm_dir": "/config/.xwechat/net/kvcomm",  # 推图片密钥用的文件夹（key_<数字>_….statistic）
+    # 照片的下载地址：连接器在容器网络里开这个端口（不映射到本机），AstrBot 按地址来取，15 分钟后失效。
+    # 0 = 不开，改用 base64（陪伴插件的群聊看图会读不了）
+    "photo_port": 6298,
+    "photo_url_base": "http://wechat:6298",  # AstrBot 容器里访问微信容器用的地址
     "receive_records": True,    # 收别人转发的聊天记录，按合并转发交给 AstrBot（里面的图片、语音换成占位）
     "max_text_chars": 1500,     # 一条文字超过这么多字就按换行拆成几条发
     "max_queue_wait": 150,  # 排队超过这么多秒还没轮到就不发了（AstrBot 等回执最多 180 秒，超时后插件可能已经改发文字）
@@ -290,6 +296,7 @@ class Connector:
         self.media = media.MediaDir(cfg["media_dir"])
         self.image_key = None      # (AES 密钥, 异或字节)：第一次收到照片时推，推不出 10 分钟后再试
         self.image_key_tried = 0.0
+        self.photo_cache: OrderedDict[str, tuple[bytes, float]] = OrderedDict()  # 下载地址里的随机名 → (图片, 过期时间)
         # 给状态页看的：启动时间、收发计数、最近一次数据库有变化的时间、密钥出错的原因、最近几次发送的结果
         self.version = VERSION
         self.started = time.time()
@@ -446,14 +453,55 @@ class Connector:
             def load(p=path):
                 with open(p, "rb") as f:
                     data = wximg.decrypt(f.read(), *self.image_key)
+                data = wximg.to_image(data) if data else None  # wxgf 转 JPEG，没有 ffmpeg 或转不出来就换下一个文件
                 return wximg.shrink(data) if data else None
             data = await asyncio.to_thread(load)
             if data:
                 kind = "缩略图" if path.endswith("_t.dat") else "高清图" if path.endswith("_h.dat") else "原图"
                 log.info("照片解开了（%s，%d KB）", kind, len(data) // 1024)
-                return {"file": "base64://" + base64.b64encode(data).decode(), "url": ""}
+                ext = media.image_ext(data)
+                if not self.cfg["photo_port"]:
+                    return {"file": "base64://" + base64.b64encode(data).decode(), "url": ""}
+                token = secrets.token_urlsafe(16)
+                self.photo_cache[token] = (data, time.time() + 900)
+                while len(self.photo_cache) > 100 or (self.photo_cache and next(iter(self.photo_cache.values()))[1] < time.time()):
+                    self.photo_cache.popitem(last=False)
+                return {"file": f"{m['photo']}.{ext}", "url": f"{self.cfg['photo_url_base'].rstrip('/')}/p/{token}.{ext}"}
         log.info("跳过 %s 的照片（%s）", self.state.id_of(chat), "文件解不开" if paths else "文件还没下载")
         return None
+
+    async def serve_photos(self, port: int) -> None:
+        """照片下载口：只认 GET /p/<随机名>.<扩展名>，15 分钟内有效；只在容器网络里，不映射到本机"""
+        types = {"jpg": "image/jpeg", "png": "image/png", "gif": "image/gif", "webp": "image/webp", "bmp": "image/bmp"}
+
+        async def handle(reader: asyncio.StreamReader, writer: asyncio.StreamWriter) -> None:
+            try:
+                head = await asyncio.wait_for(reader.readuntil(b"\r\n\r\n"), 10)
+                method, target, _ = head.split(b"\r\n", 1)[0].decode("latin-1").split(" ", 2)
+                found = re.fullmatch(r"/p/([\w-]{16,40})\.(\w+)", target.split("?", 1)[0])
+                item = self.photo_cache.get(found.group(1)) if found and method in ("GET", "HEAD") else None
+                if item and item[1] > time.time():
+                    body, head_line = item[0], f"200 OK\r\nContent-Type: {types.get(found.group(2), 'image/jpeg')}"
+                else:
+                    body, head_line = b"", "404 Not Found\r\nContent-Type: text/plain"
+                writer.write(f"HTTP/1.1 {head_line}\r\nContent-Length: {len(body)}\r\nCache-Control: no-store\r\n"
+                             f"Connection: close\r\n\r\n".encode() + (b"" if method == "HEAD" else body))
+                await writer.drain()
+            except (asyncio.TimeoutError, asyncio.IncompleteReadError, asyncio.LimitOverrunError, ValueError,
+                    ConnectionError):
+                pass
+            finally:
+                writer.close()
+
+        try:
+            server = await asyncio.start_server(handle, "0.0.0.0", port, limit=16384)
+        except OSError as e:
+            log.warning("照片下载口没开起来（端口 %d：%s），照片改用 base64", port, e.strerror or type(e).__name__)
+            self.cfg["photo_port"] = 0
+            return
+        log.info("照片下载口：容器网络里的 %d 端口", port)
+        async with server:
+            await server.serve_forever()
 
     async def sticker_image(self, sticker: dict | None) -> dict | None:
         """表情包 → image 段要的 {file: 文件名, url: 原图地址}。先下载一次核对（能下、是图片、md5 对、不太大），
@@ -749,6 +797,8 @@ class Connector:
         tasks = [asyncio.create_task(self.poll_loop())]
         if self.cfg["webui_port"]:
             tasks.append(asyncio.create_task(webui.serve(self, self.cfg["webui_host"], int(self.cfg["webui_port"]))))
+        if self.cfg["receive_photos"] and self.cfg["photo_port"]:
+            tasks.append(asyncio.create_task(self.serve_photos(int(self.cfg["photo_port"]))))
         if not self.cfg["receive_only"]:
             tasks.append(asyncio.create_task(self.send_worker()))
             tasks.append(asyncio.create_task(self.ob.run_forever()))

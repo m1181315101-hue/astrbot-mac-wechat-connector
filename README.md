@@ -43,7 +43,7 @@
 | `connector/wxdb.py` | 解密数据库（SQLCipher 4）：主库加 WAL 增量叠加，用 `sqlite3.deserialize` 在内存里打开，读新消息和通讯录 |
 | `connector/wxui.py` | 界面驱动：通过无障碍接口（AT-SPI）读微信界面，按名字找会话，用 xdotool 点击和粘贴；发语音条时点「发语音」、把音频播进虚拟麦克风、再点「发送语音」 |
 | `connector/onebot.py` | OneBot v11 反向 WebSocket 客户端，以及消息事件的格式 |
-| `connector/wximg.py` | 解开微信加密存的照片（.dat，V2 格式）：图片密钥从本机 kvcomm 文件夹推出来、拿真图片核对；太大的缩小 |
+| `connector/wximg.py` | 解开微信加密存的照片（.dat，V2 格式）：图片密钥从本机 kvcomm 文件夹推出来、拿真图片核对；wxgf 原图用 ffmpeg 转成 JPEG；太大的缩小 |
 | `connector/media.py` | 把 AstrBot 发来的图片、语音（base64）落成临时文件：WEBP 转 PNG；语音条用 wav（mp3 用 lame 解码，超过 55 秒切段），退回文件时用 lame 转 mp3；估算音频时长 |
 | `connector/bridge.py` | 主程序：轮询、白名单、发送队列、限速、确认 |
 | `connector/webui.py` | 只读状态页：微信进程和窗口、数据库密钥、AstrBot 连接、发送队列、收发计数、日志 |
@@ -142,10 +142,12 @@ docker exec -u abc wechat /lsiopy/bin/python3 /opt/wechat-connector/bridge.py lo
 | `receive_stickers` | 收别人发的表情包，默认 `true`：按消息里的地址下载原图核对（md5、格式、大小），合格的以图片段交给 AstrBot：格式和 NapCat 一样，`file` 是文件名、`url` 是原图地址 |
 | `group_stickers` | 群里的表情包也收，默认 `true`。AstrBot 不会因为一张表情包就回话（除非被 @ 或引用），但陪伴类插件如果开着「群聊看图」，每张都会多调一次看图模型；想省就设成 `false`，只收私聊的 |
 | `max_sticker_kb` | 超过这么大的表情包不收，默认 5120（5MB） |
-| `receive_photos` | 收别人发的照片，默认 `true`：解开微信本地加密存的图片（见第 7 步「照片」），以图片段交给 AstrBot，`file` 是 `base64://…`（照片没有能下载的地址）。长边超过 1600 或大于 1.5MB 的缩成 JPEG |
+| `receive_photos` | 收别人发的照片，默认 `true`：解开微信本地加密存的图片（见第 7 步「照片」），和表情包一样以图片段交给 AstrBot：`file` 是文件名，`url` 是连接器临时提供的下载地址（见 `photo_port`）。wxgf 格式的原图用 ffmpeg 转成 JPEG；长边超过 1600 或大于 1.5MB 的缩成 JPEG |
 | `group_photos` | 群里的照片也收，默认 `true`。和群表情包一样，陪伴类插件开着「群聊看图」时每张会多调一次看图模型 |
 | `photo_wait_seconds` | 别人发的原图要微信自动下载完才有，最多等这么久，默认 3；等不到就用缩略图 |
 | `kvcomm_dir` | 推图片密钥用的文件夹，默认 `/config/.xwechat/net/kvcomm` |
+| `photo_port` | 照片下载口，默认 6298：连接器在容器网络里开这个端口（compose 里不映射到本机），AstrBot 按图片段里的地址来取，地址里是随机名，15 分钟后失效。`0` 是不开、改用 `base64://`，但陪伴插件的群聊看图会把它当成文件路径、读不了 |
+| `photo_url_base` | AstrBot 容器访问微信容器用的地址，默认 `http://wechat:6298`（compose 里的服务名） |
 | `receive_records` | 收别人转发的聊天记录，默认 `true`：消息里给一段「[对话记录] 标题」文字加一个 `forward` 段（标题去掉了「的聊天记录」，故意不写「聊天记录」「转发」这几个词：陪伴插件看到它们会先拿这个人上一份聊天记录），AstrBot 和插件用 `get_forward_msg` 取各条内容（格式和 NapCat 一样）；里面的图片、语音、视频换成「[图片]」这样的占位，链接、文件带标题，嵌套的聊天记录展开成缩进的文字 |
 | `webui_port` | 只读状态页的端口，默认 `6299`，`0` 是不开；`webui_host` 默认 `127.0.0.1`，只有容器里的 nginx 能访问，见第 6 步 |
 
@@ -199,6 +201,8 @@ docker exec -u 0 wechat s6-svc -u /run/service/svc-wechat-connector
 
 推不出来时（比如 kvcomm 里没有 `key_` 文件），照片照旧跳过，10 分钟后再试。
 
+别人发的原图很多是微信自家的 wxgf 格式（里面是 HEVC 编码的一帧），连接器用镜像里的 ffmpeg 转成 JPEG；转不出来时改用高清图或缩略图。旧镜像建的容器没有 ffmpeg，可以不重建容器、先在容器里装上：`docker exec -u 0 wechat sh -c 'apt-get update && apt-get install -y --no-install-recommends ffmpeg'`（重建容器后就用镜像里的）。
+
 ## 和 AstrBot 一起用的建议
 
 - **微信上的人在 AstrBot 里是一串数字。** 连接器把每个 wxid 换成一个固定的整数（OneBot 号，`bridge.py lookup` 能查），AstrBot 看到的「QQ 号」「群号」就是它。人格或插件里按 ID 认人的（比如「这个号是主人」），要把微信上的 OneBot 号也写进去。
@@ -221,11 +225,12 @@ docker exec -u 0 wechat s6-svc -u /run/service/svc-wechat-connector
 | 发后确认 | 发完回查数据库，确认真的多了一条自己发出的消息 |
 | 隐私 | 日志只记 OneBot 号、时间和字数，不记内容；解密后的明文只在内存里，不写盘；图片密钥每次启动现推，不存文件、不打日志 |
 | 状态页 | 只在容器里监听，经网页桌面的 nginx（要密码）访问；只读，只支持 GET，不显示消息内容、昵称和令牌 |
+| 照片下载口 | 只在容器网络里，不映射到本机；只认地址里 22 位的随机名，15 分钟后失效，最多留 100 张，只放内存 |
 
 ## 已知限制
 
 - **收**：只收文字、引用回复、表情包、照片和聊天记录。别人发的语音、视频、链接卡片会被跳过（日志里记一行类型）；被引用的如果是图片、表情这类，AstrBot 只看到「[图片]」「[表情]」这样的占位。
-- **照片清晰度**：别人发的原图很多是微信自家的 wxgf 格式（里面是 HEVC 编码），容器里没有解码器，这种就改用高清图或缩略图；群里别人发的图，微信常常只自动下载缩略图，所以看图模型拿到的可能只有两三百像素。
+- **照片清晰度**：群里别人发的图，微信常常只自动下载缩略图，等 `photo_wait_seconds` 还没有原图时，看图模型拿到的只有两三百像素。
 - **聊天记录只记在内存里**：最近 100 份，AstrBot 收到时马上来取，连接器重启前的取不到。聊天记录里只有每条的昵称，看不出是谁的微信号，所以里面的人不会被认成主人这类特定用户。只有一段「[对话记录]」加 `forward` 段的消息，群里照样要 @ 小号或引用才会触发回复。
 - **引用只记在内存里**：被引用的那条最多记 200 条，AstrBot 收到引用回复时马上来取（`get_msg`），平时够用；连接器重启前的引用取不到。她回复时也不会带引用框，发的是普通消息。
 - **语音条按实际时长录**：一段 20 秒的语音要录 20 秒，这期间界面被占着，后面的消息排队。超过 55 秒的切成几条（微信语音条最长 60 秒）。

@@ -2,6 +2,13 @@
 
 > 2026-10-28 之前的条目照搬自原仓库 [dafeiyu-astrbot](https://github.com/m1181315101-hue/dafeiyu-astrbot) 的更新日志，路径改成了本仓库的。条目里的「她」「小号」指作者自己部署的那个 AstrBot 角色和它的微信小号。
 
+## 2026-10-29 · 0.9.1：群里的照片也能看，wxgf 原图转成 JPEG
+
+- 实测发现：0.9.0 的照片用 `base64://` 交给 AstrBot，私聊能看，群里陪伴插件把 `file` 当成文件路径去读，报「文件名太长」，整张放弃。现在照片和表情包一样，`file` 是文件名、`url` 是下载地址：连接器在容器网络里开一个照片下载口（`photo_port`，默认 6298，不映射到本机），地址里是随机名，15 分钟后失效。AstrBot 按地址取回来，陪伴插件私聊、群聊都走它自己下载好的那份。
+- 别人发的原图很多是微信自家的 wxgf 格式（HEVC）。镜像里加了 ffmpeg，按 VPS 分组挑出完整的一帧转成 JPEG（做法参考 WeFlow 的 unwrapWxgf），转不出来再用高清图或缩略图。
+- 新配置 `photo_port`、`photo_url_base`。
+- 验证：作者本机容器里最近 6 张 wxgf 原图都转成了 JPEG（每张约 0.1 秒）；AstrBot 容器按地址取回了 4 张 JPEG（145、243、8、151 KB，之前只能给 8 KB 左右的缩略图），乱猜的地址是 404。
+
 ## 2026-10-29 · 0.9.0：收照片
 
 - 别人发的照片（local_type 3）不再跳过。微信 4.x 把图片加密存成 `.dat`（V2：开头 AES-128-ECB、结尾异或一个字节），新模块 `wximg.py` 负责解开：解法参考 [hicccc77/WeFlow](https://github.com/hicccc77/WeFlow)。

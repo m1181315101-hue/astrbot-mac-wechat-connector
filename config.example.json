@@ -14,6 +14,8 @@
   "group_stickers": true,
   "receive_photos": true,
   "group_photos": true,
+  "photo_port": 6298,
+  "photo_url_base": "http://wechat:6298",
   "receive_records": true,
   "webui_port": 6299
 }
