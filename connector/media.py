@@ -1,8 +1,10 @@
 """AstrBot 发来的图片、语音 → 微信能发的临时文件
 
 AstrBot 的 aiocqhttp 适配器把 Image / Record 都转成 base64://… 放进消息段，不用和 AstrBot 共享文件夹。
-- 图片：PNG / JPEG 原样落盘；WEBP、BMP 转成 PNG；GIF 默认取中间一帧转成 PNG（send_gif_as_still），
-  不转的话粘贴后是动画表情，但对方有时收到的是一个 .gif 文件
+- 图片：PNG / JPEG 原样落盘；WEBP、BMP 转成 PNG。GIF 原样粘贴时，1MB 以内微信存成表情（47，和表情面板里的
+  一样会动、按表情大小显示），超过就存成动画表情附件（49, 8），对方有时收到的是一个 .gif 文件（实测：
+  0.99MB 是表情，1.13MB 就成了附件）。所以超过 gif_emoji_max_bytes 的先缩尺寸、抽帧压到上限以内，
+  压不下来才取中间一帧转成 PNG；send_gif_as_still 打开时一律取一帧
 - 语音：wav 用 lame 转成 mp3，mp3 原样用；粘贴后是音频文件（电脑版微信发不了「按住说话」的语音条）
 临时文件放在 media_dir 下各自的子目录里，超过 10 分钟的自动清掉。
 """
@@ -17,6 +19,35 @@ import time
 import urllib.request
 
 MAX_BYTES = 20 * 1024 * 1024
+GIF_EMOJI_MAX_BYTES = 1_000_000  # 微信把粘贴的 GIF 当表情的上限（实测 0.99MB 可以、1.13MB 不行）
+
+
+def shrink_gif(data: bytes, limit: int) -> bytes | None:
+    """把动图压到 limit 字节以内：先缩尺寸（长边 360 → 240 → 160），还不够再隔帧抽掉（时长加倍，速度不变）。
+    压不下来返回 None"""
+    from PIL import Image
+    with Image.open(io.BytesIO(data)) as im:
+        frames, durations = [], []
+        for i in range(getattr(im, "n_frames", 1)):
+            im.seek(i)
+            frames.append(im.convert("RGBA"))
+            durations.append(im.info.get("duration", 100) or 100)
+        loop = im.info.get("loop", 0)
+    for step in (1, 2, 3):
+        picked = frames[::step]
+        times = [sum(durations[i:i + step]) for i in range(0, len(durations), step)]
+        for side in (360, 240, 160):
+            out = io.BytesIO()
+            scaled = []
+            for f in picked:
+                f = f.copy()
+                f.thumbnail((side, side))
+                scaled.append(f)
+            scaled[0].save(out, "GIF", save_all=True, append_images=scaled[1:], duration=times, loop=loop,
+                           disposal=2, optimize=True)
+            if out.tell() <= limit:
+                return out.getvalue()
+    return None
 
 
 def load_data(file_val: str) -> bytes | None:
@@ -115,11 +146,20 @@ class MediaDir:
         self._cleanup()
         return tempfile.mkdtemp(dir=self.root)
 
-    def image_file(self, data: bytes, still_gif: bool = False) -> str | None:
-        """still_gif：GIF 取中间一帧存成 PNG 当图片发（粘贴 GIF 时对方有时收到的是一个 .gif 文件）"""
+    def image_file(self, data: bytes, still_gif: bool = False, gif_max: int = GIF_EMOJI_MAX_BYTES) -> str | None:
+        """GIF 在 gif_max 以内原样发（微信当表情），超过先压缩，压不下来或者 still_gif 才取一帧存成 PNG"""
         ext = image_ext(data)
         if not ext:
             return None
+        if ext == "gif" and not still_gif and len(data) > gif_max:
+            try:
+                smaller = shrink_gif(data, gif_max)
+            except Exception:  # noqa: BLE001 - 压缩失败就退回取一帧
+                smaller = None
+            if smaller:
+                data = smaller
+            else:
+                still_gif = True
         if ext in ("webp", "bmp") or (ext == "gif" and still_gif):
             from PIL import Image  # 只在要转格式时才用
             buf = io.BytesIO()

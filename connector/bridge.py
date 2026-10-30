@@ -48,7 +48,7 @@ import webui  # noqa: E402
 import wxdb  # noqa: E402
 import wximg  # noqa: E402
 
-VERSION = "0.13.0"
+VERSION = "0.14.0"
 HERE = os.path.dirname(os.path.abspath(__file__))
 # 界面驱动的这些失败都发生在回车之前（回车前核对失败时已经清空输入框），一个字都没发出去，可以重试
 # 发图片后回查数据库确认用：PNG/JPG 存成图片 3，GIF 粘贴后存成动画表情附件 (49, 8)，有时是表情 47
@@ -79,7 +79,8 @@ DEFAULTS = {
     "receive_stickers": True,   # 收别人发的表情包，当成图片交给 AstrBot
     "group_stickers": True,     # 群里的表情包也收（陪伴类插件开着群聊看图时，每张会多一次看图调用）
     "max_sticker_kb": 5120,     # 超过这么大的表情包不收
-    "send_gif_as_still": True,  # AstrBot 发来的 GIF 取中间一帧当图片发（粘贴 GIF 时对方有时收到的是一个 .gif 文件）
+    "send_gif_as_still": False,  # 打开就一律把 GIF 取中间一帧当图片发；关着时 1MB 以内的动图原样发成会动的表情
+    "gif_emoji_max_kb": 1000,  # 超过这么大的 GIF 先压缩到这以内再发（微信当表情的上限约 1MB，再大就成了附件）
     "receive_photos": True,     # 收别人发的照片（解开微信加密存的图片，当成图片交给 AstrBot）
     "group_photos": True,       # 群里的照片也收（和群表情包一样，陪伴类插件每张会多一次看图调用）
     "photo_wait_seconds": 3,    # 原图还没下载完时最多等这么久，等不到就用缩略图
@@ -861,7 +862,8 @@ class Connector:
         if not data:
             return [], "取不到媒体数据（可能是只在 AstrBot 容器里的文件路径）", b""
         if kind == "image":
-            path = self.media.image_file(data, still_gif=self.cfg["send_gif_as_still"])
+            path = self.media.image_file(data, still_gif=self.cfg["send_gif_as_still"],
+                                         gif_max=int(self.cfg["gif_emoji_max_kb"]) * 1000)
             return ([("file", path, 0.0)], "", data) if path else ([], "不认识的图片格式", data)
         seconds = media.audio_seconds(data)
         min_seconds = self.cfg["group_voice_min_seconds"]
