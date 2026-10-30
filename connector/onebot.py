@@ -182,14 +182,18 @@ def private_message_event(self_id: int, user_id: int, nickname: str, message_id:
 
 def group_message_event(self_id: int, group_id: int, user_id: int, nickname: str, message_id: int,
                         text: str, at_self: bool, ts: int, reply_id: int | None = None,
-                        image: dict | None = None, forward: dict | None = None) -> dict:
-    """at_self：微信里有人 @ 了小号，就在前面放一个 at 段，AstrBot 按「被 @」处理"""
+                        image: dict | None = None, forward: dict | None = None,
+                        at_others: list[int] | None = None) -> dict:
+    """at_self：微信里有人 @ 了小号，就在前面放一个 at 段，AstrBot 按「被 @」处理；
+    at_others：同一条里 @ 的别人，各放一个 at 段（AstrBot 会用 get_group_member_info 取昵称，写回正文）"""
+    others = [{"type": "at", "data": {"qq": str(qq)}} for qq in at_others or []]
     reply, raw = _reply_seg(reply_id)
     img, img_raw = _image_seg(image)
     fwd, fwd_raw = _forward_seg(forward)
-    message = reply + ([{"type": "at", "data": {"qq": str(self_id)}}] if at_self else []) + img + fwd + \
+    message = reply + ([{"type": "at", "data": {"qq": str(self_id)}}] if at_self else []) + others + img + fwd + \
         ([{"type": "text", "data": {"text": text}}] if text else [])  # 只 @ 不说话时正文为空
-    raw += (f"[CQ:at,qq={self_id}] " if at_self else "") + img_raw + fwd_raw + text
+    raw += (f"[CQ:at,qq={self_id}] " if at_self else "") + "".join(f"[CQ:at,qq={qq}] " for qq in at_others or []) + \
+        img_raw + fwd_raw + text
     return {
         "time": ts, "self_id": self_id, "post_type": "message", "message_type": "group", "sub_type": "normal",
         "message_id": message_id, "group_id": group_id, "user_id": user_id, "font": 0, "anonymous": None,

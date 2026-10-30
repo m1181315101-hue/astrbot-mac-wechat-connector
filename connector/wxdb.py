@@ -256,10 +256,20 @@ class PlainDB:
 # ---------- 账号：消息和联系人 ----------
 
 GROUP_PREFIX = re.compile(r"^[A-Za-z0-9_\-@.]+:\n")
+# 群里 @ 了谁记在消息来源（source 列）的 atuserlist 里，按 @ 的先后；@所有人 是 notify@all
+AT_USERLIST = re.compile(r"<atuserlist>(?:<!\[CDATA\[)?(.*?)(?:\]\]>)?</atuserlist>", re.S)
+# 正文里的 @：「@名字」后面跟一个 U+2005，和 atuserlist 一一对应（名字是群昵称，对不上通讯录）
+AT_MENTION = re.compile("@[^@\u2005]{1,30}\u2005")
 QUOTE_PLACEHOLDER = {3: "[图片]", 34: "[语音]", 43: "[视频]", 47: "[表情]", 48: "[位置]", 42: "[名片]"}
 # 聊天记录里每条的 datatype：1 是文字，17 是嵌套的聊天记录，其余换成占位（链接、文件这类后面跟标题）
 RECORD_PLACEHOLDER = {2: "[图片]", 3: "[语音]", 4: "[视频]", 5: "[链接]", 6: "[位置]", 8: "[文件]",
                       17: "[聊天记录]", 19: "[小程序]", 22: "[视频号]", 29: "[音乐]", 37: "[表情]"}
+
+
+def parse_at_users(source) -> list[str]:
+    """群消息被 @ 的人的 wxid（含 notify@all），没有就是空列表"""
+    found = AT_USERLIST.search(decode_content(source))
+    return [w.strip() for w in found.group(1).split(",") if w.strip()] if found else []
 
 
 def parse_quote(xml_text: str, depth: int = 0) -> dict | None:
@@ -497,9 +507,9 @@ class WeChatStore:
             me = self._self_rowid(con)
             names = dict(con.execute("select rowid, user_name from Name2Id"))
             rows = con.execute(f"select local_id, server_id, local_type, create_time, real_sender_id, message_content, "
-                               f"packed_info_data from {table} where local_id > ? order by local_id",
+                               f"packed_info_data, source from {table} where local_id > ? order by local_id",
                                (marks.get(name, 0),)).fetchall()
-            for local_id, server_id, local_type, create_time, sender, content, packed in rows:
+            for local_id, server_id, local_type, create_time, sender, content, packed, source in rows:
                 marks[name] = local_id
                 if sender == me:
                     continue
@@ -541,7 +551,8 @@ class WeChatStore:
                     photo = found.group().decode() if found else None
                 out.append({"local_id": local_id, "server_id": server_id, "type": base_type, "time": create_time,
                             "sender": names.get(sender, ""), "text": text, "quote": quote, "sticker": sticker,
-                            "record": record, "photo": photo, "joined": joined, "pat": pat})
+                            "record": record, "photo": photo, "joined": joined, "pat": pat,
+                            "at_users": parse_at_users(source) if wxid.endswith("@chatroom") else []})
         return out
 
     def photo_files(self, wxid: str, ts: int, name: str) -> list[str]:

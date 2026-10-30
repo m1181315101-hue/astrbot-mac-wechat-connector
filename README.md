@@ -127,7 +127,7 @@ docker exec -u abc wechat /lsiopy/bin/python3 /opt/wechat-connector/bridge.py lo
 | `access_token` | 反向 WS 口令，要和 AstrBot 平台里填的一样 |
 | `whitelist` | 允许私聊的人（wxid 列表）。写 `"*"` 就是通讯录里的**所有好友**（以后新加的好友也自动算；群成员这类陌生人、公众号、系统账号不算）。不在里面的人发来的消息不转发、不回复 |
 | `group_whitelist` | 允许的群（`xxx@chatroom` 列表） |
-| `bot_names` | 群里 @ 小号时可能用的名字（比如小号的群昵称）。小号自己的微信昵称会自动加上 |
+| `bot_names` | 群里 @ 小号时可能用的名字（比如小号的群昵称）。小号自己的微信昵称会自动加上。0.13.0 起另外按消息里的 @ 名单认：名单里有小号也算 @ 了小号，@ 的别人转成 at 段 |
 | `receive_only` | `true` 时只读消息、写日志，不连 AstrBot。第一次部署建议先开着试 |
 | `face_map` | 可选。如果 AstrBot 装了把 `[旺柴]` 这类文字换成 QQ 表情的插件（比如 [astrbot_plugin_face_convert](https://github.com/m1181315101-hue/dafeiyu-astrbot/tree/main/plugin/astrbot_plugin_face_convert)），把它的 `face_map.json` 复制到 `./data/wechat-connector/` 里再填这一项：回复里的 QQ 表情会翻回 `[旺柴]` 这种文字，微信会显示成表情 |
 | `max_sends_per_minute` | 每分钟最多发几条，默认 20，多出来的排队 |

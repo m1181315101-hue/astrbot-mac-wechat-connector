@@ -48,7 +48,7 @@ import webui  # noqa: E402
 import wxdb  # noqa: E402
 import wximg  # noqa: E402
 
-VERSION = "0.12.0"
+VERSION = "0.13.0"
 HERE = os.path.dirname(os.path.abspath(__file__))
 # 界面驱动的这些失败都发生在回车之前（回车前核对失败时已经清空输入框），一个字都没发出去，可以重试
 # 发图片后回查数据库确认用：PNG/JPG 存成图片 3，GIF 粘贴后存成动画表情附件 (49, 8)，有时是表情 47
@@ -376,6 +376,21 @@ class Connector:
             if changed:
                 self.state.save()
 
+    def strip_mentions(self, text: str, at_users: list[str]) -> str:
+        """@ 名单和正文里的「@名字 」个数一样时，按位置把真的 @ 从正文里拿掉（改放 at 段）；
+        @所有人 留在正文里（不放 at 段，免得变成叫她）。个数对不上就不动正文。
+        顺手把「@名字」记成这个人的群昵称：通讯录里没有他时，get_group_member_info 用它"""
+        mentions = list(wxdb.AT_MENTION.finditer(text))
+        if not at_users or len(mentions) != len(at_users):
+            return text
+        for found, wxid in reversed(list(zip(mentions, at_users))):
+            if wxid != "notify@all":
+                self.member_names.setdefault(wxid, found.group()[1:-1])
+                text = text[:found.start()] + text[found.end():]
+        while len(self.member_names) > 500:
+            self.member_names.popitem(last=False)
+        return text.strip()
+
     async def deliver(self, chat: str, m: dict) -> None:
         """chat：私聊是对方 wxid，群是 xxx@chatroom；m["sender"] 是实际发言人的 wxid"""
         cid = self.state.id_of(chat)
@@ -427,18 +442,22 @@ class Connector:
         if chat.endswith("@chatroom"):
             sender = m["sender"] or "unknown"
             uid = self.state.id_of(sender)
-            text = m["text"]
-            at_self = bool(self.at_pattern and self.at_pattern.search(text))
-            if at_self:
+            text, at_users = m["text"], m.get("at_users") or []
+            at_self = bool(self.at_pattern and self.at_pattern.search(text)) or self.store.self_wxid in at_users
+            text = self.strip_mentions(text, at_users)
+            if at_self and self.at_pattern:
                 text = self.at_pattern.sub("", text, count=1).strip()
+            at_others = [self.state.id_of(w) for w in dict.fromkeys(at_users)
+                         if w not in (self.store.self_wxid, "notify@all")]
             if image:
                 log.info("群 %s 里 %s 发了%s", cid, uid, label)
             elif forward:
                 log.info("群 %s 里 %s 转发了聊天记录（%d 条）", cid, uid, len(m["record"]["items"]))
             else:
-                log.info("群 %s 里 %s 发了文字 %d 字%s%s", cid, uid, len(text), "，@ 了小号" if at_self else "", quote_note)
+                log.info("群 %s 里 %s 发了文字 %d 字%s%s%s", cid, uid, len(text), "，@ 了小号" if at_self else "",
+                         f"，@ 了别人 {len(at_others)} 个" if at_others else "", quote_note)
             event = onebot.group_message_event(self.self_id, cid, uid, self.store.display_name(sender), mid,
-                                               text, at_self, int(m["time"]), reply_id, image, forward)
+                                               text, at_self, int(m["time"]), reply_id, image, forward, at_others)
         else:
             if image:
                 log.info("收到 %s 的私聊%s", cid, label)
