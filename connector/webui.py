@@ -940,7 +940,8 @@ body:not(.setup) .steps > li.run-only::after, body.setup .steps > li.setup-only:
 .savebar .dot { color: var(--ok-mark); }
 .savebar.dirty .dot { color: var(--warn-mark); }
 .savebar strong { font-size: 13.5px; }
-.savebar .sub { margin-right: auto; }
+.savebar .sub { flex: 1 1 200px; min-width: 0; }  /* 放不下时说明先自己换行，不把按钮挤到下一行 */
+.savebar .actions { margin-left: auto; }  /* 两个按钮放在一起，要折行就一起折 */
 
 /* 日志 */
 .toolbar { display: flex; flex-wrap: wrap; align-items: center; gap: 10px 12px; padding: 10px 12px; }
@@ -1017,6 +1018,8 @@ select { min-height: 44px; padding: 0 12px; border: 0; border-radius: 12px; font
   .ln .t, .ln .lv { margin-right: 8px; }
   .ln .m { display: block; }
   .savebar .sub { display: none; }
+  .savebar .actions { flex-basis: 100%; }
+  .savebar .actions .btn { flex: 1; }
   #notice { top: 64px; }
 }
 @media (prefers-reduced-motion: reduce) {
@@ -1262,8 +1265,8 @@ select { min-height: 44px; padding: 0 12px; border: 0; border-radius: 12px; font
     <div class="savebar run-only" id="savebar">
       <span class="dot"></span><strong id="dirty">没有改动</strong>
       <span class="sub">收发开关、数字和白名单一起保存；保存前会留一份 config.json.bak</span>
-      <button class="btn" id="reset" type="button" disabled>撤销改动</button>
-      <button class="btn primary" id="save" type="button" disabled>保存并重启</button>
+      <div class="actions"><button class="btn" id="reset" type="button" disabled>撤销改动</button>
+      <button class="btn primary" id="save" type="button" disabled>保存并重启</button></div>
     </div>
   </section>
 
