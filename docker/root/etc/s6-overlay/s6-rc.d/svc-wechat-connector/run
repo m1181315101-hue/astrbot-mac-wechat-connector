@@ -1,11 +1,11 @@
 #!/usr/bin/with-contenv bash
-# 微信连接器：等配置、密钥和微信都就绪了再启动；没就绪就过一会儿重试（s6 会重新拉起）
+# 微信连接器：配置和密钥都在就等微信起来再启动；缺一个就先开首次配置页（状态页上扫码登录、填 AstrBot 地址和口令），
+# 两份都有了它自己退出，s6 重新拉起来时就是正常模式。挂了会被 s6 重新拉起
 CONF=/config/wechat-connector/config.json
 KEYS=/config/wechat-connector/keys.json
 if [ ! -f "$CONF" ] || [ ! -f "$KEYS" ]; then
-  echo "[wechat-connector] 还没有 config.json 或 keys.json（见 README 第 3、4 步），60 秒后再看"
-  sleep 60
-  exit 0
+  echo "[wechat-connector] 还没有 config.json 或 keys.json，先开首次配置页：https://localhost:3001/wxc/"
+  exec s6-setuidgid abc /lsiopy/bin/python3 -u /opt/wechat-connector/bridge.py setup --config "$CONF"
 fi
 until pgrep -x wechat >/dev/null; do
   sleep 2

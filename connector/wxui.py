@@ -6,7 +6,9 @@ Linux 微信是 Qt 写的，带无障碍桥：打开 org.a11y.Status.IsEnabled �
 标准输入每行一个 JSON 请求，标准输出每行一个 JSON 结果：
 
   {"op": "ping"}
-  {"op": "status"}  → {"ok": true, "frame": true, "width": 880, "height": 640}（只读，不动窗口）
+  {"op": "status"}  → {"ok": true, "frame": true, "width": 880, "height": 640, "login": false}（只读，不动窗口）
+  {"op": "login"}   → {"ok": true, "login": true, "state": "qr", "text": "用小号扫码登录", "others": 0}（只读）
+  {"op": "login", "grab": true} → 再加 "png": 登录窗口截图（base64）；不是登录窗口就 {"ok": false, "reason": ...}
   {"op": "send", "name": "备注名", "text": "...", "sections": ["联系人"], "use_list": true, "delay": 1.2}
   {"op": "send", "name": "备注名", "file": "/tmp/xx/语音.mp3", "sections": ["群聊"], "use_list": true}
   {"op": "send", "name": "备注名", "voice": "/tmp/xx/voice.wav", "sections": ["联系人"], "use_list": true}
@@ -22,8 +24,10 @@ Linux 微信是 Qt 写的，带无障碍桥：打开 org.a11y.Status.IsEnabled �
 - 会话列表只在 use_list=true（调用方确认这个名字在通讯录里独一无二）时用，按第一行精确匹配；
 - 搜索结果只认 sections 指定分组里名字完全相同的那一项，「搜索网络结果」「聊天记录」永远不点；
 - 粘贴前、回车前都核对底部输入框的无障碍名字 == 目标名字，对不上就放弃，一个字都不发。
+- 截图只截登录窗口：按里面的控件认出来是登录窗口、旁边没开别的微信窗口，截前截后各认一次，主窗口永远不截。
 不往标准输出写任何聊天内容；日志只写到标准错误，而且只有名字长度、坐标和结果。
 """
+import base64
 import json
 import os
 import re
@@ -386,6 +390,113 @@ def handle_send(req: dict) -> dict:
     return {"ok": True, "path": how}
 
 
+# 登录窗口才有的控件：扫码、确认、断网这些状态的控件一直都在树里，只是没显示
+LOGIN_MARKS = {"二维码", "扫码登录", "进入微信", "切换账号", "仅传输文件", "网络代理设置"}
+# 显示着哪个控件 → 登录窗口现在是什么状态（按顺序认第一个）
+LOGIN_STATES = (("网络连接已断开", "offline", "网络连接已断开"), ("无法加载", "offline", "二维码加载不出来"),
+                ("需在手机上完成登录", "confirm", "需在手机上完成登录"),
+                ("进入微信", "confirm", "要点「进入微信」，再在手机上确认（去网页桌面点）"),
+                ("正在进入", "loading", "正在进入"), ("正在加载", "loading", "正在加载"),
+                ("二维码", "qr", "用小号扫码登录"))
+
+
+def tree_names(node, limit: int = 800) -> tuple[set[str], set[str]]:
+    """一个窗口里控件的名字（包括没显示的），以及其中显示着（宽高不为 0）的那些；最多看 limit 个控件"""
+    names, shown, stack = set(), set(), [(node, 0)]
+    while stack and limit > 0:
+        n, depth = stack.pop()
+        limit -= 1
+        try:
+            name = n.get_name() or ""
+            e = n.get_extents(Atspi.CoordType.SCREEN)
+            count = n.get_child_count()
+        except Exception:
+            continue
+        if name:
+            names.add(name)
+            if e.width > 0 and e.height > 0:
+                shown.add(name)
+        if depth < 30:
+            stack.extend((n.get_child_at_index(i), depth + 1) for i in range(count))
+    return names, shown
+
+
+def login_window():
+    """找登录窗口（只读）：显示着、不大于 600×800（无障碍坐标）、里面至少有 4 个登录窗口才有的控件。
+    返回 (登录窗口或 None, 它里面显示着的控件名字, 别的显示着的微信窗口个数)"""
+    app = wechat_app()
+    login, shown, others = None, set(), 0
+    for i in range(app.get_child_count() if app else 0):
+        top = app.get_child_at_index(i)
+        try:
+            _x, _y, w, h = ext(top)
+        except Exception:
+            continue
+        if w <= 0 or h <= 0:  # 收在托盘里、没显示的窗口
+            continue
+        if login is None and w <= 600 and h <= 800:
+            names, seen = tree_names(top)
+            if len(names & LOGIN_MARKS) >= 4:
+                login, shown = top, seen
+                continue
+        others += 1
+    return login, shown, others
+
+
+def login_state(shown: set[str]) -> tuple[str, str]:
+    for name, state, text in LOGIN_STATES:
+        if name in shown:
+            return state, text
+    return "unknown", "停在登录窗口（看截图里的提示）"
+
+
+def login_info() -> dict:
+    login, shown, others = login_window()
+    if login is None:
+        return {"ok": True, "login": False}
+    state, text = login_state(shown)
+    return {"ok": True, "login": True, "state": state, "text": text, "others": others}
+
+
+def png_size(data: bytes) -> tuple[int, int]:
+    if data[:8] != b"\x89PNG\r\n\x1a\n" or data[12:16] != b"IHDR":
+        return 0, 0
+    return int.from_bytes(data[16:20], "big"), int.from_bytes(data[20:24], "big")
+
+
+def login_x_window(frame) -> tuple[str, int, int]:
+    """登录窗口对应的 X 窗口：微信进程的窗口里，位置、大小和无障碍坐标成同一个比例（缩放）的那个。返回 (窗口号, 宽, 高)"""
+    x, y, w, h = ext(frame)
+    for wid in sh("xdotool", "search", "--onlyvisible", "--pid", str(wechat_app().get_process_id())).split():
+        geo = dict(l.split("=", 1) for l in sh("xdotool", "getwindowgeometry", "--shell", wid).splitlines())
+        gx, gy, gw, gh = (int(geo.get(k, 0)) for k in ("X", "Y", "WIDTH", "HEIGHT"))
+        s = gw / w
+        if 0.9 <= s <= 4 and all(abs(a - b * s) <= 2 + s for a, b in ((gh, h), (gx, x), (gy, y))):
+            return wid, gw, gh
+    return "", 0, 0
+
+
+def grab_login() -> dict:
+    """截登录窗口：截前截后都要认得出是登录窗口、位置没变、旁边没开别的微信窗口，图的大小和窗口对得上，否则不给图"""
+    login, shown, others = login_window()
+    if login is None:
+        return {"ok": False, "reason": "现在不是登录窗口，不截图"}
+    if others:
+        return {"ok": False, "reason": "还开着别的微信窗口，不截图（去网页桌面看）"}
+    before = ext(login)
+    wid, gw, gh = login_x_window(login)
+    if not wid:
+        return {"ok": False, "reason": "没找到登录窗口对应的 X 窗口"}
+    png = subprocess.run(["ffmpeg", "-v", "error", "-f", "x11grab", "-draw_mouse", "0", "-window_id", wid,
+                          "-i", os.environ.get("DISPLAY", ":1"), "-frames:v", "1", "-f", "image2pipe", "-c:v", "png",
+                          "-"], capture_output=True, timeout=15, check=False).stdout
+    after, shown, others = login_window()
+    if after is None or others or ext(after) != before or png_size(png) != (gw, gh):
+        return {"ok": False, "reason": "截图时窗口变了，这张不要"}
+    state, text = login_state(shown)
+    return {"ok": True, "login": True, "state": state, "text": text, "png": base64.b64encode(png).decode()}
+
+
 def main() -> None:
     if not enable_a11y():
         log("打开无障碍开关失败（会话总线地址不对？）")
@@ -401,7 +512,12 @@ def main() -> None:
             elif op == "status":  # 状态页用：只看不动（ping 会把窗口从托盘里拉出来、调大小）
                 frame = main_frame()
                 w, h = ext(frame)[2:] if frame is not None else (0, 0)
-                resp = {"ok": True, "frame": frame is not None, "width": w, "height": h}
+                resp = {"ok": True, "frame": frame is not None, "width": w, "height": h, "login": False}
+                if 0 < w <= 600:  # 小得像登录窗口：认一下
+                    info = login_info()
+                    resp.update(login=info["login"], login_text=info.get("text", ""))
+            elif op == "login":  # 状态页的登录页用：只读；grab 时截登录窗口
+                resp = grab_login() if req.get("grab") else login_info()
             elif op == "send":
                 resp = handle_send(req)
             else:

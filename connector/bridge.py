@@ -17,10 +17,14 @@
     引用发不出去（界面上做不了），群里回的那条后面已经有别人说过话时，改成在开头写「@名字」，免得看不出在回谁
     界面只有一个：所有要发的消息按到达顺序排成一队，一条（含它的所有段）发完再发下一条；
     界面没动过、一个字没发出去的失败（核对没过、没找到搜索框）等 2 秒重试一次
-状态页：容器里 127.0.0.1:6299 上的网页（webui.py），nginx 把网页桌面的 /wxc/ 转过来：看状态、暂停发送、改常用设置
+状态页：容器里 127.0.0.1:6299 上的网页（webui.py），nginx 把网页桌面的 /wxc/ 转过来：
+    看状态、扫码登录、暂停发送、发测试消息、改常用设置和 AstrBot 地址口令、看日志
+首次配置：还没有 config.json 或 keys.json 时只开状态页（扫码登录、抓密钥的命令、填 AstrBot 地址和口令），
+    两份都有了就退出，s6 重新拉起来时就是正常模式
 
 用法（在微信容器里，用和微信相同的用户运行）：
   python3 bridge.py run    [--config /config/wechat-connector/config.json]
+  python3 bridge.py setup  [--config ...]            首次配置（s6 在缺 config.json 或 keys.json 时运行它）
   python3 bridge.py check  [--config ...]            检查密钥、数据库、界面驱动是否就绪
   python3 bridge.py lookup <备注名或昵称> [--config ...]  按名字查 wxid（配置白名单用）
   python3 bridge.py test-media [--config ...]         给「文件传输助手」发一组文字、图片、动图、语音，自测发送
@@ -48,7 +52,7 @@ import webui  # noqa: E402
 import wxdb  # noqa: E402
 import wximg  # noqa: E402
 
-VERSION = "0.14.0"
+VERSION = "0.15.0"
 HERE = os.path.dirname(os.path.abspath(__file__))
 # 界面驱动的这些失败都发生在回车之前（回车前核对失败时已经清空输入框），一个字都没发出去，可以重试
 # 发图片后回查数据库确认用：PNG/JPG 存成图片 3，GIF 粘贴后存成动画表情附件 (49, 8)，有时是表情 47
@@ -57,6 +61,16 @@ IMAGE_TYPES = (3, 47, (49, 8))
 SKIPPED_TYPES = {3: "图片", 34: "语音", 42: "名片", 43: "视频", 48: "位置", 49: "链接/文件/小程序", 50: "通话"}
 RETRYABLE = ("粘贴前核对失败", "回车前核对失败", "没找到搜索框", "打开后输入框名字对不上", "找不到微信主窗口")
 log = logging.getLogger("wechat-connector")
+
+
+class _TestTarget:
+    """状态页「发测试消息」在发送队列里的目标。AstrBot 给的目标都是字符串，伪造不了它"""
+
+    def __str__(self) -> str:
+        return "文件传输助手"
+
+
+TEST_TARGET = _TestTarget()
 
 DEFAULTS = {
     "astrbot_ws_url": "ws://astrbot:6200/ws",
@@ -100,10 +114,11 @@ DEFAULTS = {
 }
 
 
-def load_config(path: str) -> dict:
+def load_config(path: str, must_exist: bool = True) -> dict:
     cfg = json.loads(json.dumps(DEFAULTS))
-    with open(path, encoding="utf-8") as f:
-        cfg.update(json.load(f))
+    if must_exist or os.path.exists(path):  # 首次配置时可以还没有 config.json
+        with open(path, encoding="utf-8") as f:
+            cfg.update(json.load(f))
     for key in ("whitelist", "group_whitelist", "bot_names"):
         cfg[key] = [str(w).strip() for w in cfg[key] if str(w).strip()]
     cfg["_config_path"] = path  # 状态页保存设置时写回这个文件
@@ -187,8 +202,11 @@ class UiDriver:
         self.proc = subprocess.Popen([self.python, os.path.join(HERE, "wxui.py")], stdin=subprocess.PIPE,
                                      stdout=subprocess.PIPE, stderr=sys.stderr, env=self.env, text=True, bufsize=1)
 
-    def request(self, req: dict, timeout: float = 40.0) -> dict:
-        with self.lock:
+    def request(self, req: dict, timeout: float = 40.0, lock_wait: float | None = None) -> dict:
+        """lock_wait 给了就最多等这么久轮到界面（状态页用：正在发消息时不干等）"""
+        if not self.lock.acquire(timeout=-1 if lock_wait is None else lock_wait):
+            return {"ok": False, "busy": True, "reason": "界面正忙（正在发消息）"}
+        try:
             if self.proc is None or self.proc.poll() is not None:
                 self._start()
             try:
@@ -203,6 +221,8 @@ class UiDriver:
                 self.proc = None
                 return {"ok": False, "reason": "界面驱动无响应"}
             return json.loads(line)
+        finally:
+            self.lock.release()
 
 
 FORWARD_ACTIONS = {"send_group_forward_msg": True, "send_private_forward_msg": False}
@@ -283,6 +303,8 @@ def message_parts(message, face_names: dict[str, str], at_name=lambda qq: "") ->
 
 
 class Connector:
+    setup = False  # 状态页按这个区分正常模式和首次配置（Setup）
+
     def __init__(self, cfg: dict):
         self.cfg = cfg
         self.state_dir = cfg["state_dir"]
@@ -315,6 +337,7 @@ class Connector:
         self.last_change = 0.0
         self.key_error = ""
         self.recent_sends: deque[dict] = deque(maxlen=30)
+        self.test_pending = False  # 状态页的测试消息还在排队或正在发
         self.face_names = {}
         if cfg.get("face_map"):
             with open(cfg["face_map"], encoding="utf-8") as f:
@@ -792,7 +815,24 @@ class Connector:
             if not future.done():
                 future.set_result(result)
 
+    def send_test(self) -> int:
+        """状态页「发测试消息」：一句固定的话发给文件传输助手，排进和 AstrBot 一样的发送队列。返回前面还有几条"""
+        ahead = self.send_queue.qsize() + self.sending
+        future = asyncio.get_running_loop().create_future()
+        future.add_done_callback(lambda _f: setattr(self, "test_pending", False))
+        self.test_pending = True
+        text = f"微信连接器 {VERSION} 测试消息 {time.strftime('%H:%M:%S')}"
+        self.send_queue.put_nowait((time.time(), TEST_TARGET, {"text": text}, False, future))
+        log.info("状态页：发一条测试消息给文件传输助手%s", f"，前面还有 {ahead} 条" if ahead else "")
+        return ahead
+
     async def _send_job(self, target_id: str, params: dict, group: bool):
+        if target_id is TEST_TARGET:  # 状态页的测试消息：内容和目标都是连接器自己定的
+            if os.path.exists(os.path.join(self.state_dir, "STOP")):
+                log.warning("有 STOP 文件，测试消息不发")
+                return "failed", 1503, {"message": "连接器已暂停发送"}
+            return await self.send_parts("文件传输助手", "filehelper", "文件传输助手", ["功能"],
+                                         [("text", params["text"])], group=False)
         wxid = self.state.ids.get(target_id)
         if group:
             allowed = self.groups
@@ -943,6 +983,49 @@ class Connector:
         await asyncio.gather(*tasks)
 
 
+class Setup:
+    """首次配置：还没有 config.json 或 keys.json 时只开状态页（扫码登录、抓密钥的命令、填 AstrBot 地址和口令）。
+    不读数据库、不收不发；两份都有了就退出，s6 重新拉起来时就是正常模式"""
+    setup = True
+
+    def __init__(self, cfg: dict):
+        self.cfg = cfg
+        self.state_dir = cfg["state_dir"]
+        self.version = VERSION
+        self.started = time.time()
+        self.sending = False
+        self.send_queue: asyncio.Queue = asyncio.Queue()  # 一直是空的：状态页按它判断「正在发消息」
+        self._ui = None
+
+    @property
+    def ui(self) -> UiDriver | None:
+        """微信可能比这里晚起来：拿到它的会话总线以前是 None，状态页就当微信没在运行"""
+        if self._ui is None:
+            env = wechat_env()
+            if "DBUS_SESSION_BUS_ADDRESS" in env:
+                self._ui = UiDriver(self.cfg["ui_python"], env)
+        return self._ui
+
+    def files(self) -> dict[str, bool]:
+        return {"config.json": os.path.exists(self.cfg["_config_path"]),
+                "keys.json": os.path.exists(os.path.join(self.state_dir, "keys.json"))}
+
+    async def wait_files(self) -> None:
+        while True:
+            await asyncio.sleep(3)
+            if all(self.files().values()):
+                log.info("config.json 和 keys.json 都有了，切到正常模式")
+                os._exit(0)  # s6 重新拉起来时就是正常模式
+
+    async def run(self) -> None:
+        missing = [k for k, v in self.files().items() if not v]
+        log.info("微信连接器 %s 首次配置：还没有 %s，只开状态页", VERSION, "、".join(missing))
+        tasks = [asyncio.create_task(self.wait_files())]
+        if self.cfg["webui_port"]:
+            tasks.append(asyncio.create_task(webui.serve(self, self.cfg["webui_host"], int(self.cfg["webui_port"]))))
+        await asyncio.gather(*tasks)
+
+
 def cmd_check(cfg: dict) -> int:
     keys = wxdb.KeyStore(os.path.join(cfg["state_dir"], "keys.json"))
     print("密钥原料：", "有" if keys.passphrase else "没有（先运行 wxkey.py capture）")
@@ -1016,10 +1099,18 @@ def cmd_test_media(cfg: dict) -> int:
 
 def main() -> None:
     ap = argparse.ArgumentParser()
-    ap.add_argument("cmd", choices=["run", "check", "lookup", "test-media"])
+    ap.add_argument("cmd", choices=["run", "setup", "check", "lookup", "test-media"])
     ap.add_argument("name", nargs="?")
     ap.add_argument("--config", default="/config/wechat-connector/config.json")
     args = ap.parse_args()
+    if args.cmd == "setup":
+        try:
+            cfg = load_config(args.config, must_exist=False)
+        except (OSError, ValueError) as e:  # config.json 坏了也要把页面开起来：页面上提示，保存时整份重写（旧的留成 .bak）
+            cfg = {**json.loads(json.dumps(DEFAULTS)), "_config_path": args.config, "_config_error": type(e).__name__}
+        setup_logging(cfg["state_dir"])
+        asyncio.run(Setup(cfg).run())
+        return
     cfg = load_config(args.config)
     if args.cmd == "check":
         sys.exit(cmd_check(cfg))

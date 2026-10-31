@@ -10,12 +10,33 @@ import hashlib
 import json
 import logging
 import re
+import socket
 import time
 from collections import deque
 
 import websockets
 
 log = logging.getLogger("wechat-connector")
+
+
+def describe_error(e: Exception) -> str:
+    """连不上 AstrBot 的原因，给日志和状态页看（不带地址和口令）"""
+    status = getattr(getattr(e, "response", None), "status_code", None)
+    if status in (401, 403):
+        return f"AstrBot 拒绝了连接（HTTP {status}），多半是口令不对"
+    if status:
+        return f"AstrBot 回了 HTTP {status}（地址的路径不对？）"
+    if isinstance(e, websockets.InvalidURI):
+        return "地址格式不对"
+    if isinstance(e, websockets.InvalidMessage):  # 开了 fake-ip 代理的机器上，写错的主机名也能解析出地址
+        return "对方没按 WebSocket 回应（地址、端口写错了？）"
+    if isinstance(e, ConnectionRefusedError):
+        return "连接被拒绝（AstrBot 没开这个端口，或者还没起来）"
+    if isinstance(e, socket.gaierror):
+        return "找不到这个主机（地址写错了，或者两个容器不在同一个 Docker 网络）"
+    if isinstance(e, TimeoutError):
+        return "连接超时"
+    return type(e).__name__
 
 
 def stable_id(text: str) -> int:
@@ -100,8 +121,8 @@ class OneBotClient:
                     finally:
                         hb.cancel()
             except (OSError, websockets.WebSocketException) as e:
-                log.warning("连接 AstrBot 失败或断开（%s），5 秒后重连", type(e).__name__)
-                self.last_error = type(e).__name__
+                self.last_error = describe_error(e)
+                log.warning("连接 AstrBot 失败或断开（%s），5 秒后重连", self.last_error)
             if self.ws is not None:
                 self.disconnects += 1
             self.ws = None
