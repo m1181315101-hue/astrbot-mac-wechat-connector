@@ -53,8 +53,9 @@ class OneBotClient:
         self.ws = None
         self.buffer: deque[tuple[float, dict]] = deque(maxlen=50)  # AstrBot 重启期间先攒着
         self.buffer_seconds = buffer_seconds
-        self.connected_at = 0.0  # 给状态页看：这次连上的时间、断开过几次、最近一次断开的原因
+        self.connected_at = 0.0  # 给状态页看：这次连上的时间、断开过几次、上次什么时候断的、最近一次断开的原因
         self.disconnects = 0
+        self.disconnected_at = 0.0
         self.last_error = ""
 
     async def push(self, event: dict) -> None:
@@ -125,6 +126,7 @@ class OneBotClient:
                 log.warning("连接 AstrBot 失败或断开（%s），5 秒后重连", self.last_error)
             if self.ws is not None:
                 self.disconnects += 1
+                self.disconnected_at = time.time()
             self.ws = None
             await asyncio.sleep(5)
 

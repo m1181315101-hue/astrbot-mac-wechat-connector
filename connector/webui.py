@@ -3,7 +3,7 @@
 
 监听容器里的 127.0.0.1:6299（webui_host / webui_port），只有同一个容器里的 nginx 能访问到；
 nginx 把网页桌面（3001 端口，有密码）的 /wxc/ 转过来，所以打开 https://localhost:3001/wxc/ 就能看，密码和网页桌面一样。
-页面分「概览 / 登录 / 设置 / 日志」四页；首次配置（还没有 config.json 或 keys.json）时只有「首次配置 / 日志」。
+页面左边是导航（窄屏收进菜单），分「概览 / 登录 / 设置 / 日志」四页；首次配置（还没有 config.json 或 keys.json）时只有「首次配置 / 日志」。
 不动微信窗口：查窗口用界面驱动只读的 status / login，不用会把窗口拉出来的 ping。
 截图只截登录窗口：认不出是登录窗口、或者旁边开着别的微信窗口就不截，所以页面上不会出现聊天内容。
 状态和日志里没有消息内容和令牌，会话只用 OneBot 号表示；「设置」里的白名单会显示 wxid 和备注名（改白名单要用）。
@@ -185,7 +185,8 @@ class LoginView:
 async def status(c, probe: WindowProbe) -> dict:
     now = time.time()
     checks = []
-    if await asyncio.to_thread(wechat_running):
+    running = await asyncio.to_thread(wechat_running)
+    if running:
         checks.append(("微信进程", "ok", "在运行"))
     else:
         checks.append(("微信进程", "bad", "没在运行"))
@@ -237,10 +238,21 @@ async def status(c, probe: WindowProbe) -> dict:
     async with c.db_lock:
         people = len(await asyncio.to_thread(c.private_targets))
     level = "bad" if any(x[1] == "bad" for x in checks) else "warn" if any(x[1] == "warn" for x in checks) else "ok"
+    up = ob.ws is not None
     return {
         "mode": "run", "version": c.version, "now": now, "uptime": ago(now - c.started), "level": level,
         "paused": paused, "busy": bool(queued), "receive_only": bool(c.cfg["receive_only"]),
-        "test_pending": c.test_pending,
+        "test_pending": c.test_pending, "self_id": c.self_id,
+        "wechat": {"running": running, "checked": "ok" in window, "login": bool(window.get("login")),
+                   "window": bool(window.get("ok") and window.get("frame"))},
+        # 断开多久：连上过就从上次断开算，一直没连上就从启动算
+        "astrbot": {"connected": up, "url": safe_url(str(c.cfg["astrbot_ws_url"]))[0],
+                    "token_set": bool(c.cfg["access_token"]), "disconnects": ob.disconnects, "buffered": len(ob.buffer),
+                    "since": ago(now - (ob.connected_at if up else ob.disconnected_at or c.started)),
+                    "error": "" if up else ob.last_error or "正在连"},
+        "send": {"queued": queued, "sending": bool(c.sending), "paused": paused,
+                 "last_minute": sum(1 for t in c.sent_times if now - t <= 60),
+                 "per_minute": c.cfg["max_sends_per_minute"]},
         "checks": [{"name": n, "level": lv, "text": t} for n, lv, t in checks],
         "counts": dict(sorted(c.counts.items())),
         "recent_sends": [{**s, "ago": ago(now - s["time"])} for s in reversed(sends[-12:])],
@@ -584,264 +596,723 @@ PAGE = r"""<!doctype html>
 <meta name="color-scheme" content="light dark">
 <title>微信连接器</title>
 <script>
-try { const t = localStorage.getItem("wxc-theme"); if (t === "light" || t === "dark") document.documentElement.dataset.theme = t; } catch (e) {}
+try {
+  const t = localStorage.getItem("wxc-theme");
+  if (t === "light" || t === "dark") document.documentElement.dataset.theme = t;
+  if (localStorage.getItem("wxc-side") === "0") document.documentElement.classList.add("side-off");
+} catch (e) {}
 </script>
 <style>
 :root {
-  --bg: #f6f7f9; --card: #ffffff; --text: #1d2129; --muted: #6b7280; --line: #e5e7eb;
-  --ok: #16a34a; --ok-bg: #dcfce7; --warn: #b45309; --warn-bg: #fef3c7; --bad: #dc2626; --bad-bg: #fee2e2;
-  --code: #f3f4f6; color-scheme: light;
+  --sans: -apple-system, BlinkMacSystemFont, "PingFang SC", "Hiragino Sans GB", "Noto Sans CJK SC", "Microsoft YaHei", sans-serif;
+  --mono: ui-monospace, "SF Mono", SFMono-Regular, Menlo, Consolas, monospace;
+  --accent: #db2777; --accent-text: #b42062; --accent-soft: rgba(219, 39, 119, .11); --accent-pill: rgba(219, 39, 119, .32);
+  --bg: #fbfbfd; --card: rgba(255, 255, 255, .8); --card-2: #fff; --line: rgba(15, 23, 42, .08);
+  --text: #18181b; --text-2: #3f3f46; --muted: #62626b; --field: rgba(15, 23, 42, .05); --switch-off: #8b8b95;
+  --shadow: 0 1px 2px rgba(15, 23, 42, .04), 0 6px 22px -10px rgba(15, 23, 42, .12);
+  --ok: #15803d; --ok-bg: #dcfce7; --ok-mark: #16a34a;
+  --warn: #b45309; --warn-bg: #fef3c7; --warn-mark: #d97706;
+  --bad: #b91c1c; --bad-bg: #fee2e2; --bad-mark: #dc2626;
+  --blob-1: rgba(244, 114, 182, .14); --blob-2: rgba(167, 139, 250, .16); --blob-3: rgba(251, 113, 133, .09);
+  --term: #111216; --term-line: rgba(255, 255, 255, .07); --term-text: #d9dce3; --term-muted: #8b909c;
+  color-scheme: light;
 }
 @media (prefers-color-scheme: dark) {
   :root:not([data-theme="light"]) {
-    --bg: #111317; --card: #1a1d23; --text: #e5e7eb; --muted: #9ca3af; --line: #2b2f36;
-    --ok: #4ade80; --ok-bg: #14301f; --warn: #fbbf24; --warn-bg: #3a2e10; --bad: #f87171; --bad-bg: #3b1717;
-    --code: #0d0f12; color-scheme: dark;
+    --accent-text: #ed93bb; --accent-soft: rgba(219, 39, 119, .22);
+    --bg: #0d0d11; --card: rgba(28, 28, 34, .8); --card-2: #1c1c22; --line: rgba(255, 255, 255, .08);
+    --text: #ececf1; --text-2: #c9c9d1; --muted: #9d9daa; --field: rgba(255, 255, 255, .07); --switch-off: #5e5e69;
+    --shadow: 0 1px 2px rgba(0, 0, 0, .4), 0 8px 26px -10px rgba(0, 0, 0, .6);
+    --ok: #4ade80; --ok-bg: rgba(74, 222, 128, .14); --ok-mark: #4ade80;
+    --warn: #fbbf24; --warn-bg: rgba(251, 191, 36, .14); --warn-mark: #fbbf24;
+    --bad: #f87171; --bad-bg: rgba(248, 113, 113, .15); --bad-mark: #f87171;
+    --blob-1: rgba(236, 72, 153, .10); --blob-2: rgba(139, 92, 246, .13); --blob-3: rgba(244, 63, 94, .06);
+    --term: #09090c; color-scheme: dark;
   }
 }
 :root[data-theme="dark"] {
-  --bg: #111317; --card: #1a1d23; --text: #e5e7eb; --muted: #9ca3af; --line: #2b2f36;
-  --ok: #4ade80; --ok-bg: #14301f; --warn: #fbbf24; --warn-bg: #3a2e10; --bad: #f87171; --bad-bg: #3b1717;
-  --code: #0d0f12; color-scheme: dark;
+  --accent-text: #ed93bb; --accent-soft: rgba(219, 39, 119, .22);
+  --bg: #0d0d11; --card: rgba(28, 28, 34, .8); --card-2: #1c1c22; --line: rgba(255, 255, 255, .08);
+  --text: #ececf1; --text-2: #c9c9d1; --muted: #9d9daa; --field: rgba(255, 255, 255, .07); --switch-off: #5e5e69;
+  --shadow: 0 1px 2px rgba(0, 0, 0, .4), 0 8px 26px -10px rgba(0, 0, 0, .6);
+  --ok: #4ade80; --ok-bg: rgba(74, 222, 128, .14); --ok-mark: #4ade80;
+  --warn: #fbbf24; --warn-bg: rgba(251, 191, 36, .14); --warn-mark: #fbbf24;
+  --bad: #f87171; --bad-bg: rgba(248, 113, 113, .15); --bad-mark: #f87171;
+  --blob-1: rgba(236, 72, 153, .10); --blob-2: rgba(139, 92, 246, .13); --blob-3: rgba(244, 63, 94, .06);
+  --term: #09090c; color-scheme: dark;
 }
 * { box-sizing: border-box; }
 [hidden] { display: none !important; }
 html { -webkit-text-size-adjust: 100%; }
-body { margin: 0; background: var(--bg); color: var(--text);
-  font: 14px/1.6 -apple-system, BlinkMacSystemFont, "PingFang SC", "Noto Sans CJK SC", "Microsoft YaHei", sans-serif; }
-main { max-width: 1080px; margin: 0 auto; padding: 0 16px 40px; }
-.top { display: flex; align-items: center; gap: 8px 12px; flex-wrap: wrap; padding: 16px 0 10px; }
-.top .tools { margin-left: auto; display: flex; gap: 10px; align-items: center; }
-h1 { font-size: 20px; margin: 0; }
-h2 { font-size: 15px; margin: 0 0 10px; }
-h3.step { font-size: 15px; margin: 18px 0 8px; }
-nav.tabs { position: sticky; top: 0; z-index: 5; display: flex; overflow-x: auto; scrollbar-width: none;
-  background: var(--bg); border-bottom: 1px solid var(--line); margin: 0 -16px 14px; padding: 0 10px; }
-nav.tabs::-webkit-scrollbar { display: none; }
-nav.tabs a { flex: 0 0 auto; padding: 9px 14px; color: var(--muted); text-decoration: none; border-bottom: 2px solid transparent; }
-nav.tabs a.on { color: var(--text); border-bottom-color: var(--text); font-weight: 600; }
-.tab { display: none; }
-.tab.on { display: block; }
-body.setup .run-only, body:not(.setup) .setup-only { display: none !important; }
-.muted { color: var(--muted); }
-.pill { padding: 2px 10px; border-radius: 999px; font-weight: 600; font-size: 13px; }
-.ok { color: var(--ok); } .warn { color: var(--warn); } .bad { color: var(--bad); }
-.pill.ok { background: var(--ok-bg); } .pill.warn { background: var(--warn-bg); } .pill.bad { background: var(--bad-bg); }
-.grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(min(320px, 100%), 1fr)); gap: 12px; margin-bottom: 12px; }
-.card { background: var(--card); border: 1px solid var(--line); border-radius: 10px; padding: 14px 16px; min-width: 0; margin-bottom: 12px; }
-.grid > .card { margin-bottom: 0; }
-.check { display: flex; gap: 10px; padding: 6px 0; border-top: 1px solid var(--line); }
-.check:first-of-type { border-top: 0; }
-.check b { flex: 0 0 72px; font-weight: 600; }
-.check span:last-child { min-width: 0; overflow-wrap: anywhere; }
-.dot { flex: 0 0 8px; height: 8px; margin-top: 8px; border-radius: 50%; background: currentColor; }
-table { width: 100%; border-collapse: collapse; }
-td, th { text-align: left; padding: 4px 6px; border-top: 1px solid var(--line); vertical-align: top; }
-th { color: var(--muted); font-weight: 500; }
-#sends th, #sends td:nth-child(-n+3) { white-space: nowrap; }
-.kv td:first-child { color: var(--muted); width: 40%; }
-.kv td:last-child { overflow-wrap: anywhere; }
-code { background: var(--code); border-radius: 4px; padding: 1px 5px; font-size: 12px; word-break: break-all; }
+body { margin: 0; min-height: 100vh; color: var(--text); font: 14px/1.55 var(--sans); background-color: var(--bg);
+  background-image: radial-gradient(44rem 30rem at -4% 4%, var(--blob-1), transparent 70%),
+    radial-gradient(40rem 34rem at 104% 38%, var(--blob-2), transparent 70%),
+    radial-gradient(46rem 30rem at 30% 108%, var(--blob-3), transparent 70%);
+  background-attachment: fixed; }
 a { color: inherit; }
-ul, ol { margin: 0; padding-left: 20px; }
-li { margin: 6px 0; }
-p { margin: 0 0 8px; }
-.scroll { overflow-x: auto; }
-button { font: inherit; padding: 5px 12px; border-radius: 8px; border: 1px solid var(--line); background: var(--card);
-  color: var(--text); cursor: pointer; }
-button:hover { border-color: var(--muted); }
-button.primary { background: var(--text); color: var(--bg); border-color: var(--text); }
-button:disabled { opacity: .5; cursor: default; }
-.actions { display: flex; gap: 8px; flex-wrap: wrap; align-items: center; }
-input[type=number], input[type=text], input[type=password], select, textarea { font: inherit; color: var(--text);
-  background: var(--bg); border: 1px solid var(--line); border-radius: 6px; padding: 4px 8px; max-width: 100%; }
-input[type=text].wide, input[type=password].wide { width: 100%; }
-textarea { width: 100%; min-height: 72px; font: 12px/1.5 ui-monospace, SFMono-Regular, Menlo, monospace; }
-.field { display: flex; align-items: center; justify-content: space-between; gap: 10px; padding: 6px 0;
-  border-top: 1px solid var(--line); }
-.field:first-child { border-top: 0; }
-.field.block { display: block; }
-.field.block > label { display: block; margin-bottom: 4px; }
-.hint { font-size: 12px; color: var(--muted); }
-.found { display: flex; justify-content: space-between; align-items: center; gap: 8px; padding: 3px 0; overflow-wrap: anywhere; }
-.qr { margin-top: 12px; }
-.qr img { display: block; width: 280px; max-width: 100%; height: auto; border: 1px solid var(--line); border-radius: 8px;
-  background: #fff; }
-.logbar { display: flex; gap: 8px; flex-wrap: wrap; align-items: center; margin-bottom: 8px; }
-.logbar input[type=text] { flex: 1 1 160px; }
-.log { max-height: min(70vh, 640px); overflow: auto; background: var(--code); border-radius: 8px; padding: 10px;
-  font: 12px/1.5 ui-monospace, SFMono-Regular, Menlo, monospace; white-space: pre-wrap; word-break: break-all; }
-.log .warn, .log .bad { font-weight: 600; }
-#notice { position: fixed; right: 16px; bottom: 16px; max-width: 360px; padding: 10px 14px; border-radius: 10px;
-  background: var(--text); color: var(--bg); display: none; z-index: 10; }
-@media (max-width: 640px) {
-  main { padding: 0 12px 32px; }
-  nav.tabs { margin: 0 -12px 12px; padding: 0 4px; }
-  h1 { font-size: 18px; }
-  .card { padding: 12px; }
-  .check b { flex-basis: 64px; }
-  .kv td:first-child { width: 45%; }
-  #notice { left: 12px; right: 12px; max-width: none; }
+p { margin: 0; }
+code { font: 12.5px var(--mono); }
+:focus-visible { outline: 2px solid var(--accent); outline-offset: 2px; }
+.i { width: 18px; height: 18px; flex: none; fill: none; stroke: currentColor; stroke-width: 1.8; stroke-linecap: round; stroke-linejoin: round; }
+body.setup .run-only, body:not(.setup) .setup-only { display: none !important; }
+
+/* 框架：左边导航，右边顶栏加内容 */
+.app { display: flex; min-height: 100vh; }
+.side { position: sticky; top: 0; height: 100vh; width: 226px; flex: none; display: flex; flex-direction: column;
+  padding: 20px 12px 18px; overflow-y: auto; }
+.side-off .side { display: none; }
+.brand { display: flex; align-items: center; gap: 10px; padding: 6px 12px 22px; }
+.brand .bar { width: 4px; height: 20px; flex: none; border-radius: 2px; background: var(--accent); }
+.brand strong { font-size: 18px; letter-spacing: .02em; white-space: nowrap; }
+.brand .ver { margin-left: auto; font: 11px var(--mono); color: var(--muted); }
+.brand .close { display: none; }
+.nav { display: flex; flex-direction: column; gap: 6px; }
+.nav a { display: flex; align-items: center; gap: 10px; min-height: 44px; padding: 0 14px; border-radius: 12px;
+  color: var(--text-2); text-decoration: none; }
+.nav a:hover { background: var(--field); }
+.nav a span { flex: 1; }
+.nav a i { width: 12px; height: 4px; border-radius: 2px; background: var(--accent-pill); }
+.nav a.on { color: var(--accent-text); background: var(--accent-soft); font-weight: 600; }
+.nav a.on i { width: 16px; background: var(--accent); }
+.side-note { margin: 18px 12px 0; font-size: 12px; color: var(--muted); }
+.side-foot { margin-top: auto; display: flex; flex-direction: column; gap: 10px; padding: 24px 8px 0; }
+.pill-btn { display: flex; align-items: center; justify-content: center; gap: 6px; min-height: 44px; padding: 0 14px; border: 0;
+  border-radius: 999px; font: 600 13px var(--sans); color: var(--accent-text); background-color: var(--accent-soft);
+  text-decoration: none; cursor: pointer; }
+.pill-btn .i { width: 16px; height: 16px; margin-right: 2px; }
+.pill-btn:hover, .btn:hover, .icon-btn:hover, .x:hover, .cmd button:hover {
+  background-image: linear-gradient(rgba(127, 127, 127, .12), rgba(127, 127, 127, .12)); }
+.main { flex: 1; min-width: 0; padding: 16px 16px 40px; }
+.topbar { position: sticky; top: 12px; z-index: 6; display: flex; align-items: center; gap: 10px; min-height: 48px;
+  margin-bottom: 16px; padding: 0 14px 0 6px; border-radius: 14px; background: var(--card);
+  -webkit-backdrop-filter: blur(16px) saturate(140%); backdrop-filter: blur(16px) saturate(140%);
+  border: 1px solid var(--line); box-shadow: var(--shadow); }
+.topbar h1 { margin: 0; font-size: 15px; font-weight: 650; white-space: nowrap; }
+.icon-btn { width: 40px; height: 40px; flex: none; display: inline-flex; align-items: center; justify-content: center;
+  border: 0; border-radius: 10px; color: var(--text-2); background-color: transparent; cursor: pointer; }
+.status { margin-left: auto; min-width: 0; display: inline-flex; align-items: center; gap: 8px; padding: 4px 12px;
+  border-radius: 999px; font-size: 12.5px; font-weight: 600; }
+.status #overalltext { min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.status.ok { color: var(--ok); background: var(--ok-bg); }
+.status.warn { color: var(--warn); background: var(--warn-bg); }
+.status.bad { color: var(--bad); background: var(--bad-bg); }
+.dot { position: relative; width: 8px; height: 8px; flex: none; border-radius: 50%; background: currentColor; }
+.dot.live::before { content: ""; position: absolute; inset: 0; border-radius: 50%; background: currentColor;
+  animation: pulse 2.4s ease-out infinite; }
+@keyframes pulse { 0% { transform: scale(.8); opacity: .6; } 70% { transform: scale(1.8); opacity: 0; } 100% { opacity: 0; } }
+.stamp { font: 12px var(--mono); color: var(--muted); white-space: nowrap; }
+.wrap { max-width: 1040px; margin: 0 auto; }
+.tab { display: none; flex-direction: column; gap: 16px; }
+.tab.on { display: flex; }
+
+/* 通用 */
+.card { min-width: 0; padding: 18px 20px; border-radius: 16px; background: var(--card);
+  -webkit-backdrop-filter: blur(16px) saturate(140%); backdrop-filter: blur(16px) saturate(140%);
+  border: 1px solid var(--line); box-shadow: var(--shadow); }
+.card h2 { display: flex; align-items: center; gap: 8px; margin: 0; font-size: 15px; line-height: 1.4; font-weight: 650; }
+.card h2 .i { width: 17px; height: 17px; color: var(--text-2); }
+.head { display: flex; flex-wrap: wrap; align-items: center; justify-content: space-between; gap: 8px 16px; margin-bottom: 12px; }
+.sub { font-size: 12.5px; color: var(--muted); }
+.lead { margin-top: 8px; font-size: 13.5px; color: var(--text-2); }
+.hint { margin: 6px 4px 0; font-size: 12px; color: var(--muted); }
+.row { display: flex; flex-wrap: wrap; gap: 16px; align-items: flex-start; }
+.row > * { flex: 1 1 380px; }
+.chip { display: inline-flex; align-items: center; gap: 4px; padding: 3px 10px; border-radius: 999px; font-size: 12px;
+  font-weight: 600; white-space: nowrap; color: var(--text-2); background: var(--field); }
+.chip.ok { color: var(--ok); background: var(--ok-bg); }
+.chip.warn { color: var(--warn); background: var(--warn-bg); }
+.chip.bad { color: var(--bad); background: var(--bad-bg); }
+.chip.accent { color: var(--accent-text); background: var(--accent-soft); }
+.mono { font-family: var(--mono); }
+.empty { padding: 14px 0; text-align: center; font-size: 13px; color: var(--muted); }
+.actions { display: flex; flex-wrap: wrap; align-items: center; gap: 10px; }
+.actions.center { justify-content: center; }
+.btn { display: inline-flex; align-items: center; justify-content: center; gap: 8px; min-height: 44px; padding: 0 16px;
+  border: 0; border-radius: 999px; font: 600 13.5px var(--sans); color: var(--text); background-color: var(--field);
+  text-decoration: none; white-space: nowrap; cursor: pointer; }
+.btn .i { width: 16px; height: 16px; }
+.btn.primary { color: #fff; background-color: var(--accent); box-shadow: 0 8px 18px -10px var(--accent); }
+.btn.soft { color: var(--accent-text); background-color: var(--accent-soft); }
+.btn.small { min-height: 40px; padding: 0 14px; font-size: 13px; }
+.btn:disabled { opacity: .5; cursor: not-allowed; background-image: none; }
+.state { display: inline-flex; align-items: center; gap: 6px; font-weight: 600; }
+.state .dot { width: 7px; height: 7px; }
+.state.ok { color: var(--ok); } .state.warn { color: var(--warn); } .state.bad { color: var(--bad); }
+
+/* 概览 */
+.ov-top { display: flex; flex-wrap: wrap; gap: 16px; }
+.ov-left { flex: 1 1 300px; min-width: 0; display: flex; flex-direction: column; gap: 16px; }
+.ov-left .grow { flex: 1; display: flex; flex-direction: column; }
+.account { position: relative; overflow: hidden; display: flex; align-items: center; gap: 14px; padding: 16px 18px; }
+.account .watermark { position: absolute; right: -12px; bottom: -20px; width: 88px; height: 88px; stroke-width: 1.2; opacity: .07; }
+.avatar { position: relative; width: 48px; height: 48px; flex: none; display: flex; align-items: center; justify-content: center;
+  border-radius: 50%; color: var(--accent-text); background: var(--accent-soft); }
+.avatar .i { width: 24px; height: 24px; }
+.avatar .online { position: absolute; right: 1px; bottom: 1px; width: 12px; height: 12px; border-radius: 50%;
+  background: var(--switch-off); box-shadow: 0 0 0 2px var(--card-2); }
+.avatar .online.ok { background: var(--ok-mark); } .avatar .online.warn { background: var(--warn-mark); }
+.avatar .online.bad { background: var(--bad-mark); }
+.account .who { position: relative; flex: 1; min-width: 0; display: flex; flex-direction: column; gap: 2px; }
+.account .who strong { font-size: 16px; line-height: 1.3; }
+.account .who span { font: 12px var(--mono); color: var(--muted); }
+.account .chip { position: relative; }
+.kv { margin: 6px 0 0; }
+.kv div { display: flex; align-items: center; justify-content: space-between; gap: 12px; padding: 7px 0; }
+.kv dt { font-size: 13px; font-weight: 500; color: var(--text-2); }
+.kv dd { margin: 0; font: 12.5px var(--mono); color: var(--muted); text-align: right; overflow-wrap: anywhere; }
+.card-foot { display: flex; flex-wrap: wrap; gap: 8px; margin-top: auto; padding-top: 12px; border-top: 1px solid var(--line); }
+.card-foot .btn { flex: 1 1 120px; }
+.ov-link { flex: 2 1 460px; display: flex; flex-wrap: wrap; align-items: center; gap: 20px 28px; }
+.ov-info { flex: 1 1 300px; min-width: 0; }
+.ov-info .actions { margin-top: 16px; }
+.grid2 { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 12px 20px; margin: 10px 0 0; }
+.grid2 .wide { grid-column: 1 / -1; }
+.grid2 dt { font-size: 12px; color: var(--muted); }
+.grid2 dd { margin: 0; font-size: 13.5px; font-weight: 500; overflow-wrap: anywhere; }
+.grid2 dd.mono { font-size: 13px; font-weight: 400; }
+.sep { height: 1px; margin: 16px 0; background: var(--line); }
+.rings { flex: 0 0 auto; display: flex; flex-direction: column; align-items: center; gap: 16px; margin: 0 auto; }
+.ring { position: relative; width: 132px; height: 132px; }
+.ring svg { display: block; width: 100%; height: 100%; transform: rotate(-90deg); }
+.ring circle { fill: none; stroke-width: 9; }
+.ring .val { stroke-linecap: round; stroke-dasharray: 0 314.16; transition: stroke-dasharray .4s; }
+.ring .txt { position: absolute; inset: 0; display: flex; flex-direction: column; align-items: center; justify-content: center; gap: 2px; }
+.ring .txt span { font-size: 11px; color: var(--muted); }
+.ring .txt strong { font: 700 26px/1.1 var(--mono); }
+.ring .txt small { font-size: 13px; font-weight: 600; color: var(--muted); }
+.tiles { display: grid; grid-template-columns: repeat(auto-fit, minmax(150px, 1fr)); gap: 16px; }
+.tile { display: flex; flex-direction: column; align-items: center; gap: 2px; padding: 16px 12px 14px; text-align: center; }
+.tile strong { font: 700 30px/1.2 var(--mono); }
+.tile span { display: inline-flex; align-items: center; gap: 6px; font-size: 12.5px; color: var(--muted); }
+.tile .mark { width: 6px; height: 6px; border-radius: 50%; background: var(--bad-mark); }
+.ov-mid { display: flex; flex-wrap: wrap; gap: 16px; align-items: flex-start; }
+.checks-card { flex: 3 1 420px; padding-bottom: 6px; }
+.counts-card { flex: 2 1 320px; }
+.checks { list-style: none; margin: 0; padding: 0; }
+.checks li { display: flex; align-items: flex-start; gap: 12px; padding: 11px 0; border-top: 1px solid var(--line); }
+.checks .ic { width: 28px; height: 28px; flex: none; margin-top: 1px; display: flex; align-items: center; justify-content: center; border-radius: 50%; }
+.checks .ic .i { width: 15px; height: 15px; stroke-width: 2.4; }
+.checks .ic.ok { color: var(--ok); background: var(--ok-bg); }
+.checks .ic.warn { color: var(--warn); background: var(--warn-bg); }
+.checks .ic.bad { color: var(--bad); background: var(--bad-bg); }
+.checks .body { flex: 1; min-width: 0; }
+.checks b { display: block; font-size: 13.5px; font-weight: 600; }
+.checks .body > span { display: block; font-size: 13px; color: var(--text-2); overflow-wrap: anywhere; }
+.checks .go { display: inline-block; margin-top: 2px; font-size: 12.5px; font-weight: 600; color: var(--accent-text); }
+.checks.compact { margin-top: 14px; }
+h3.group { margin: 14px 0 2px; font-size: 12px; font-weight: 600; color: var(--muted); }
+.bars { list-style: none; margin: 0; padding: 0; }
+.bars li { display: grid; grid-template-columns: minmax(84px, 120px) minmax(0, 1fr) 44px; align-items: center; gap: 12px; padding: 5px 0; }
+.bars li.empty { display: block; padding: 6px 0; text-align: left; }
+.bars .name { font-size: 13px; color: var(--text-2); white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+.bars .track { height: 8px; border-radius: 4px; background: var(--field); overflow: hidden; }
+.bars .fill { display: block; height: 8px; border-radius: 4px; background: var(--accent); }
+.bars .n { text-align: right; font: 600 12.5px var(--mono); }
+.sends { overflow-x: auto; }
+.sends ul { list-style: none; margin: 0; padding: 0; min-width: 520px; }
+.sends li { display: grid; grid-template-columns: 96px minmax(0, 1fr) minmax(0, 1fr) minmax(0, 1.6fr); gap: 16px; align-items: center;
+  padding: 10px 0; border-bottom: 1px solid var(--line); font-size: 13px; }
+.sends li.headrow { padding: 8px 0; font-size: 12px; font-weight: 600; color: var(--muted); }
+.sends li.empty { display: block; border: 0; }
+.sends .t { font: 12.5px var(--mono); color: var(--muted); white-space: nowrap; }
+.sends .to { font: 12.5px var(--mono); overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.sends .what { color: var(--text-2); overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.sends .res { display: inline-flex; align-items: center; gap: 6px; min-width: 0; font-weight: 600; }
+.sends .res .i { width: 15px; height: 15px; stroke-width: 2.4; }
+.sends .res span { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.sends .res.ok { color: var(--ok); } .sends .res.bad { color: var(--bad); }
+
+/* 登录 */
+.login-card { display: flex; flex-direction: column; gap: 16px; }
+.login-card .head { margin-bottom: 0; }
+.live { display: inline-flex; align-items: center; gap: 8px; font: 12px var(--mono); color: var(--muted); }
+.live .dot { width: 7px; height: 7px; color: var(--accent); }
+.banner { display: flex; align-items: center; gap: 12px; padding: 12px 14px; border-radius: 14px; color: var(--accent-text); background: var(--accent-soft); }
+.banner.ok { color: var(--ok); background: var(--ok-bg); }
+.banner.warn { color: var(--warn); background: var(--warn-bg); }
+.banner.bad { color: var(--bad); background: var(--bad-bg); }
+.banner .i { width: 22px; height: 22px; }
+.banner > div { min-width: 0; }
+.banner strong { display: block; font-size: 14px; }
+.banner #loginsub { display: block; font-size: 12.5px; color: var(--text-2); }
+.qrstage { display: flex; justify-content: center; padding: 4px 0; }
+.qrframe { width: 300px; max-width: 100%; padding: 10px; border-radius: 18px; background: #fff; border: 1px solid rgba(15, 23, 42, .06);
+  box-shadow: 0 1px 2px rgba(0, 0, 0, .06), 0 18px 40px -18px rgba(15, 23, 42, .4); }
+.qrframe img { display: block; width: 100%; height: auto; border-radius: 10px; }
+.qrempty { display: flex; flex-direction: column; align-items: center; justify-content: center; gap: 10px; min-height: 220px; padding: 20px;
+  border-radius: 18px; border: 1.5px dashed var(--line); text-align: center; font-size: 13px; color: var(--muted); }
+.qrempty .i { width: 34px; height: 34px; stroke-width: 1.4; }
+.foot-note { display: flex; align-items: flex-start; gap: 8px; padding-top: 14px; border-top: 1px solid var(--line); font-size: 12.5px; color: var(--muted); }
+.foot-note .i { width: 15px; height: 15px; margin-top: 2px; }
+.steps { list-style: none; margin: 14px 0 0; padding: 0; counter-reset: step; }
+.steps > li { position: relative; display: flex; gap: 14px; padding-bottom: 18px; counter-increment: step; }
+.steps > li::before { content: counter(step); width: 28px; height: 28px; flex: none; display: flex; align-items: center; justify-content: center;
+  border-radius: 50%; font: 700 13px var(--mono); color: var(--accent-text); background: var(--accent-soft); }
+.steps > li::after { content: ""; position: absolute; left: 13px; top: 34px; bottom: 6px; width: 2px; border-radius: 1px; background: var(--line); }
+body:not(.setup) .steps > li.run-only::after, body.setup .steps > li.setup-only::after { display: none; }
+.stepbody { flex: 1; min-width: 0; display: flex; flex-direction: column; align-items: flex-start; gap: 10px; padding-top: 3px; font-size: 13.5px; }
+.cmd { align-self: stretch; display: flex; align-items: center; gap: 8px; padding: 6px 6px 6px 14px; border-radius: 12px; background: var(--term); color: var(--term-text); }
+.cmd code { flex: 1; min-width: 0; overflow-x: auto; white-space: nowrap; }
+.cmd button { flex: none; display: inline-flex; align-items: center; gap: 6px; min-height: 40px; padding: 0 12px; border: 0; border-radius: 9px;
+  font: 600 12.5px var(--sans); color: var(--term-text); background-color: rgba(255, 255, 255, .08); cursor: pointer; }
+.cmd button .i { width: 15px; height: 15px; }
+
+/* 设置 */
+.fields { display: grid; grid-template-columns: repeat(auto-fit, minmax(min(280px, 100%), 1fr)); gap: 14px 16px; }
+.fld { display: flex; flex-direction: column; gap: 2px; padding: 8px 14px; border-radius: 14px; background: var(--field); }
+.fld:focus-within { box-shadow: inset 0 0 0 2px var(--accent); }
+.fld label, .choice-label { font-size: 12px; font-weight: 500; color: var(--text-2); }
+.fld input { width: 100%; min-height: 26px; padding: 0; border: 0; outline: 0; background: transparent; font: 13.5px var(--mono); color: var(--text); }
+.fld input:disabled { color: var(--muted); }
+.fld input::placeholder, .add input::placeholder, .search input::placeholder { color: var(--muted); opacity: 1; }
+.fld .lab { display: flex; align-items: center; justify-content: space-between; gap: 8px; }
+.tokset { display: inline-flex; align-items: center; gap: 4px; font-size: 11.5px; font-weight: 600; color: var(--ok); }
+.tokset .i { width: 12px; height: 12px; stroke-width: 2.2; }
+.check-row { display: flex; align-items: flex-start; gap: 12px; margin-top: 14px; padding: 12px 14px; border-radius: 14px; background: var(--field); }
+.check-row input { width: 20px; height: 20px; margin: 2px 0 0; flex: none; accent-color: var(--accent); }
+.check-row label { display: flex; flex-direction: column; cursor: pointer; }
+.check-row strong { font-size: 13.5px; }
+.check-row span { font-size: 12.5px; color: var(--muted); }
+.foot { display: flex; flex-wrap: wrap; align-items: center; justify-content: flex-end; gap: 12px; margin-top: 16px; padding-top: 14px; border-top: 1px solid var(--line); }
+.foot .sub { margin-right: auto; }
+.toggles { list-style: none; margin: 0; padding: 0; }
+.toggles li { display: flex; align-items: center; justify-content: space-between; gap: 16px; border-top: 1px solid var(--line); }
+.toggles li.empty { display: block; border: 0; }
+.toggles label { flex: 1; min-width: 0; padding: 12px 0; font-size: 13.5px; cursor: pointer; }
+.changed { margin-left: 8px; padding: 1px 8px; border-radius: 999px; font-size: 11px; font-weight: 600; color: var(--warn); background: var(--warn-bg); }
+.switch { position: relative; flex: none; width: 46px; height: 28px; padding: 0; border: 0; border-radius: 999px; background: var(--switch-off);
+  cursor: pointer; transition: background-color .15s; }
+.switch::after { content: ""; position: absolute; top: 3px; left: 3px; width: 22px; height: 22px; border-radius: 50%; background: #fff;
+  box-shadow: 0 1px 3px rgba(0, 0, 0, .3); transition: left .15s; }
+.switch[aria-checked="true"] { background: var(--accent); }
+.switch[aria-checked="true"]::after { left: 21px; }
+.stack { display: flex; flex-direction: column; gap: 14px; }
+.numfld { flex-direction: row; align-items: center; gap: 12px; padding: 8px 10px 8px 14px; }
+.numfld > div { flex: 1; min-width: 0; display: flex; flex-direction: column; gap: 2px; }
+.numfld input { font-size: 15px; font-weight: 600; }
+.numfld input:invalid { color: var(--bad); }
+.range { flex: none; padding: 4px 10px; border-radius: 8px; font: 12px var(--mono); color: var(--muted); background: var(--card-2); }
+.choice-label { display: block; margin: 0 0 6px 4px; }
+.seg { display: flex; gap: 4px; padding: 4px; border-radius: 14px; background: var(--field); }
+.seg button { flex: 1; min-height: 40px; padding: 0 14px; border: 0; border-radius: 10px; font: 600 13px var(--sans); color: var(--muted);
+  background: transparent; cursor: pointer; white-space: nowrap; }
+.seg button[aria-pressed="true"] { color: var(--text); background: var(--card-2); box-shadow: 0 1px 3px rgba(0, 0, 0, .12); }
+.lists { display: grid; grid-template-columns: repeat(auto-fit, minmax(min(280px, 100%), 1fr)); gap: 14px; }
+.lst { min-width: 0; display: flex; flex-direction: column; gap: 8px; padding: 14px 14px 12px; border-radius: 14px; background: var(--field); }
+.lst .top { display: flex; align-items: baseline; justify-content: space-between; gap: 8px; }
+.lst h3 { margin: 0; font-size: 14px; font-weight: 650; }
+.lst .count { font: 12px var(--mono); color: var(--muted); }
+.lst ul { list-style: none; margin: 0; padding: 0; max-height: 300px; overflow-y: auto; }
+.lst li { display: flex; align-items: center; gap: 10px; padding: 6px 0; border-top: 1px solid var(--line); }
+.lst li.empty { display: block; }
+.lst .who { flex: 1; min-width: 0; display: flex; flex-direction: column; }
+.lst .who b { font-size: 13.5px; font-weight: 600; overflow-wrap: anywhere; }
+.lst .who code { font-size: 12px; color: var(--muted); overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.lst .who code.only { font-size: 13px; color: var(--text); }
+.x { flex: none; width: 36px; height: 36px; display: inline-flex; align-items: center; justify-content: center; border: 0; border-radius: 10px;
+  color: var(--muted); background-color: transparent; cursor: pointer; }
+.chips { display: flex; flex-wrap: wrap; gap: 8px; padding-top: 8px; border-top: 1px solid var(--line); }
+.chips .name { display: inline-flex; align-items: center; gap: 2px; min-height: 36px; padding: 0 4px 0 12px; border-radius: 999px; font-size: 13px;
+  background: var(--card-2); border: 1px solid var(--line); }
+.chips .x { width: 30px; height: 30px; border-radius: 50%; }
+.chips .empty { padding: 6px 0; }
+.add { display: flex; gap: 8px; margin-top: auto; }
+.add input { flex: 1; min-width: 0; min-height: 40px; padding: 0 12px; border: 1px solid var(--line); border-radius: 10px; font: 13px var(--sans);
+  color: var(--text); background: var(--card-2); }
+.add input.mono { font: 12.5px var(--mono); }
+.add button { flex: none; width: 40px; height: 40px; display: inline-flex; align-items: center; justify-content: center; border: 0; border-radius: 10px;
+  color: var(--accent-text); background-color: var(--accent-soft); cursor: pointer; }
+.lookup { margin-top: 16px; padding-top: 16px; border-top: 1px solid var(--line); }
+.lookup .bar { display: flex; flex-wrap: wrap; align-items: stretch; gap: 10px; }
+.search-fld { flex: 1 1 320px; max-width: 560px; flex-direction: row; align-items: center; gap: 10px; }
+.search-fld > div { flex: 1; min-width: 0; display: flex; flex-direction: column; gap: 2px; }
+.search-fld input { font-family: var(--sans); }
+.search-fld .i { color: var(--muted); }
+.found { list-style: none; margin: 8px 0 0; padding: 0; max-width: 760px; }
+.found li { display: flex; flex-wrap: wrap; align-items: center; gap: 6px 12px; padding: 10px 0; border-bottom: 1px solid var(--line); }
+.found li.empty { display: block; border: 0; text-align: left; }
+.found .kind { padding: 1px 8px; border-radius: 6px; font-size: 11.5px; font-weight: 600; color: var(--text-2); background: var(--field); }
+.found code { font-size: 12px; color: var(--muted); overflow-wrap: anywhere; }
+.found .btn { margin-left: auto; }
+.savebar { position: sticky; bottom: 16px; z-index: 5; display: flex; flex-wrap: wrap; align-items: center; gap: 10px 14px;
+  padding: 10px 12px 10px 18px; border-radius: 16px; background: var(--card-2); border: 1px solid var(--line);
+  box-shadow: 0 18px 40px -18px rgba(15, 23, 42, .45); }
+.savebar .dot { color: var(--ok-mark); }
+.savebar.dirty .dot { color: var(--warn-mark); }
+.savebar strong { font-size: 13.5px; }
+.savebar .sub { margin-right: auto; }
+
+/* 日志 */
+.toolbar { display: flex; flex-wrap: wrap; align-items: center; gap: 10px 12px; padding: 10px 12px; }
+.toolbar .seg { border-radius: 12px; }
+.toolbar .seg button { min-height: 36px; border-radius: 9px; }
+.search { flex: 1 1 220px; min-width: 0; display: flex; align-items: center; gap: 8px; min-height: 44px; padding: 0 12px; border-radius: 12px; background: var(--field); }
+.search:focus-within { box-shadow: inset 0 0 0 2px var(--accent); }
+.search .i { width: 16px; height: 16px; color: var(--muted); }
+.search input { flex: 1; min-width: 0; padding: 0; border: 0; outline: 0; background: transparent; font: 13.5px var(--sans); color: var(--text); }
+select { min-height: 44px; padding: 0 12px; border: 0; border-radius: 12px; font: 13px var(--sans); color: var(--text); background: var(--field); }
+.follow { display: inline-flex; align-items: center; gap: 10px; padding: 0 4px; font-size: 13px; }
+.follow label { cursor: pointer; }
+#logcount { margin-left: auto; padding: 0 4px; font: 12px var(--mono); color: var(--muted); }
+.term { position: relative; overflow: hidden; border-radius: 16px; background: var(--term); border: 1px solid var(--line); box-shadow: var(--shadow); }
+.term-head { display: flex; align-items: center; justify-content: space-between; gap: 12px; padding: 12px 16px; border-bottom: 1px solid var(--term-line); }
+.term-head .name { display: inline-flex; align-items: center; gap: 8px; font: 600 12.5px var(--mono); color: var(--term-text); }
+.term-head .name .i { width: 16px; height: 16px; }
+.term-head .live { font-family: var(--sans); color: var(--term-muted); }
+.term-head .live .dot { color: var(--term-muted); }
+.term-head .live .dot.live { color: #4ade80; }
+.logbody { height: min(68vh, 640px); overflow: auto; padding: 10px 0 16px; font: 12.5px/1.75 var(--mono); color: var(--term-text); }
+.logbody .empty { font-family: var(--sans); color: var(--term-muted); }
+.ln { display: grid; grid-template-columns: 116px 64px minmax(0, 1fr); gap: 12px; padding: 0 16px; }
+.ln .t { color: var(--term-muted); white-space: nowrap; }
+.ln .lv { font-weight: 700; }
+.ln .m { white-space: pre-wrap; overflow-wrap: anywhere; }
+.ln.l0 .lv { color: #a1a1aa; }
+.ln.l1 .lv { color: #7dd3fc; }
+.ln.l2 { background: rgba(251, 191, 36, .07); } .ln.l2 .lv { color: #fbbf24; }
+.ln.l3 { background: rgba(248, 113, 113, .10); } .ln.l3 .lv { color: #f87171; }
+.ln.l3.cont .m { color: #fca5a5; }
+#tolatest { position: absolute; right: 16px; bottom: 16px; box-shadow: 0 8px 20px -8px rgba(0, 0, 0, .6); }
+
+/* 首次配置 */
+.stepper { list-style: none; margin: 14px 0 0; padding: 0; display: grid; grid-template-columns: repeat(auto-fit, minmax(min(220px, 100%), 1fr)); gap: 12px; }
+.stepper li { display: flex; align-items: flex-start; gap: 12px; padding: 12px 14px; border-radius: 14px; background: var(--field); }
+.stepper .num { width: 30px; height: 30px; flex: none; display: flex; align-items: center; justify-content: center; border-radius: 50%;
+  font: 700 13px var(--mono); color: var(--text-2); background: var(--card-2); border: 1px solid var(--line); }
+.stepper .num .i { width: 15px; height: 15px; }
+.stepper li.now { background: var(--accent-soft); }
+.stepper li.now .num { color: #fff; background: var(--accent); border-color: transparent; }
+.stepper li.done .num { color: var(--ok); background: var(--ok-bg); border-color: transparent; }
+.stepper strong { display: block; font-size: 13.5px; }
+.stepper .st-text { display: block; font-size: 12.5px; color: var(--muted); }
+.stepno { font-family: var(--mono); color: var(--accent-text); }
+.nested .card { background: var(--field); border-color: transparent; box-shadow: none; -webkit-backdrop-filter: none; backdrop-filter: none; }
+.note-dashed { display: flex; align-items: center; gap: 12px; padding: 14px 18px; border-radius: 16px; border: 1.5px dashed var(--line);
+  font-size: 13px; color: var(--text-2); }
+.note-dashed .i { color: var(--muted); }
+
+#notice { position: fixed; top: 72px; left: 50%; transform: translateX(-50%); z-index: 30; width: max-content;
+  max-width: min(420px, calc(100vw - 24px)); padding: 12px 16px; border-radius: 14px; background: var(--text); color: var(--bg);
+  font-size: 13.5px; box-shadow: 0 18px 40px -18px rgba(0, 0, 0, .5); display: none; }
+
+@media (max-width: 899px) {
+  .side { position: fixed; z-index: 20; top: 0; bottom: 0; left: 0; height: auto; width: 272px; background: var(--card-2);
+    box-shadow: 12px 0 40px -12px rgba(0, 0, 0, .4); transform: translateX(-105%); transition: transform .2s ease; }
+  .side-off .side { display: flex; }
+  body.drawer .side { transform: none; }
+  .brand .close { display: inline-flex; margin-left: 4px; }
+  .scrim { position: fixed; inset: 0; z-index: 15; background: rgba(0, 0, 0, .45); }
+  .main { padding: 12px 12px 32px; }
+  .topbar { top: 8px; margin-bottom: 12px; }
 }
-@media (pointer: coarse) {
-  button, select, input[type=text], input[type=password], input[type=number] { min-height: 40px; }
-  nav.tabs a { padding: 11px 16px; }
+@media (max-width: 640px) {
+  .card { padding: 14px 16px; }
+  .stamp { display: none; }
+  .tiles { grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 12px; }
+  .tile strong { font-size: 26px; }
+  .rings { flex-direction: row; gap: 12px; }
+  .ring { width: 116px; height: 116px; }
+  .ring .txt strong { font-size: 22px; }
+  .ln { display: block; padding: 2px 12px; }
+  .ln .t, .ln .lv { margin-right: 8px; }
+  .ln .m { display: block; }
+  .savebar .sub { display: none; }
+  #notice { top: 64px; }
+}
+@media (prefers-reduced-motion: reduce) {
+  .dot.live::before { animation: none; }
+  .side, .switch, .switch::after, .ring .val { transition: none; }
 }
 </style>
 </head>
 <body>
-<main>
-  <header class="top">
-    <h1>微信连接器</h1>
-    <span id="overall" class="pill warn">读取中</span>
-    <span id="meta" class="muted"></span>
-    <span class="tools">
-      <button id="theme" title="页面主题：跟随系统、浅色、深色轮换">主题：自动</button>
-      <a href="../">网页桌面</a>
-    </span>
-  </header>
-  <nav class="tabs">
-    <a href="#overview" data-tab="overview">概览</a>
-    <a href="#setup" data-tab="setup" hidden>首次配置</a>
-    <a href="#login" data-tab="login">登录</a>
-    <a href="#settings" data-tab="settings">设置</a>
-    <a href="#log" data-tab="log">日志</a>
+<svg width="0" height="0" style="position:absolute" aria-hidden="true">
+<symbol id="i-grid" viewBox="0 0 24 24"><path d="M3 3h7v9H3zM14 3h7v5h-7zM14 12h7v9h-7zM3 16h7v5H3z"/></symbol>
+<symbol id="i-scan" viewBox="0 0 24 24"><path d="M3 7V5a2 2 0 0 1 2-2h2M17 3h2a2 2 0 0 1 2 2v2M21 17v2a2 2 0 0 1-2 2h-2M7 21H5a2 2 0 0 1-2-2v-2M7 12h10"/></symbol>
+<symbol id="i-sliders" viewBox="0 0 24 24"><path d="M4 21v-7M4 10V3M12 21v-9M12 8V3M20 21v-5M20 12V3M1 14h6M9 8h6M17 16h6"/></symbol>
+<symbol id="i-term" viewBox="0 0 24 24"><path d="M4 17l6-6-6-6M12 19h8"/></symbol>
+<symbol id="i-spark" viewBox="0 0 24 24"><path d="M12 3v4M12 17v4M3 12h4M17 12h4M5.6 5.6l2.8 2.8M15.6 15.6l2.8 2.8M5.6 18.4l2.8-2.8M15.6 8.4l2.8-2.8"/></symbol>
+<symbol id="i-sun" viewBox="0 0 24 24"><circle cx="12" cy="12" r="4"/><path d="M12 2v2M12 20v2M4.9 4.9l1.4 1.4M17.7 17.7l1.4 1.4M2 12h2M20 12h2M4.9 19.1l1.4-1.4M17.7 6.3l1.4-1.4"/></symbol>
+<symbol id="i-monitor" viewBox="0 0 24 24"><path d="M3 4h18v12H3zM8 20h8M12 16v4"/></symbol>
+<symbol id="i-menu" viewBox="0 0 24 24"><path d="M3 6h18M3 12h11M3 18h18M21 9l-3 3 3 3"/></symbol>
+<symbol id="i-bubble" viewBox="0 0 24 24"><path d="M21 11.5a8.4 8.4 0 0 1-9 8.4 9 9 0 0 1-3.9-.9L3 20.5l1.6-4.3A8 8 0 0 1 3 11.5 8.4 8.4 0 0 1 12 3a8.4 8.4 0 0 1 9 8.5z"/></symbol>
+<symbol id="i-info" viewBox="0 0 24 24"><circle cx="12" cy="12" r="9"/><path d="M12 16v-4M12 8h.01"/></symbol>
+<symbol id="i-restart" viewBox="0 0 24 24"><path d="M21 12a9 9 0 1 1-2.6-6.4M21 4v5h-5"/></symbol>
+<symbol id="i-bell" viewBox="0 0 24 24"><path d="M18 8a6 6 0 1 0-12 0c0 7-3 9-3 9h18s-3-2-3-9M13.7 21a2 2 0 0 1-3.4 0"/></symbol>
+<symbol id="i-link" viewBox="0 0 24 24"><path d="M10 13a5 5 0 0 0 7.5.5l3-3a5 5 0 0 0-7-7l-1.7 1.7M14 11a5 5 0 0 0-7.5-.5l-3 3a5 5 0 0 0 7 7l1.7-1.7"/></symbol>
+<symbol id="i-send" viewBox="0 0 24 24"><path d="M22 2L11 13M22 2l-7 20-4-9-9-4z"/></symbol>
+<symbol id="i-pause" viewBox="0 0 24 24"><path d="M8 5v14M16 5v14"/></symbol>
+<symbol id="i-play" viewBox="0 0 24 24"><path d="M7 4l13 8-13 8z"/></symbol>
+<symbol id="i-shield" viewBox="0 0 24 24"><path d="M12 3l8 3v6c0 5-3.5 8-8 9-4.5-1-8-4-8-9V6zM9 12l2 2 4-4"/></symbol>
+<symbol id="i-check" viewBox="0 0 24 24"><path d="M20 6L9 17l-5-5"/></symbol>
+<symbol id="i-alert" viewBox="0 0 24 24"><path d="M10.3 3.9L1.8 18a2 2 0 0 0 1.7 3h17a2 2 0 0 0 1.7-3L13.7 3.9a2 2 0 0 0-3.4 0zM12 9v4M12 17h.01"/></symbol>
+<symbol id="i-x" viewBox="0 0 24 24"><path d="M18 6L6 18M6 6l12 12"/></symbol>
+<symbol id="i-bars" viewBox="0 0 24 24"><path d="M4 20V10M10 20V4M16 20v-7M22 20H2"/></symbol>
+<symbol id="i-history" viewBox="0 0 24 24"><path d="M3 12a9 9 0 1 0 3-6.7L3 8M3 3v5h5M12 7v5l3 2"/></symbol>
+<symbol id="i-phone" viewBox="0 0 24 24"><path d="M7 2h10a1 1 0 0 1 1 1v18a1 1 0 0 1-1 1H7a1 1 0 0 1-1-1V3a1 1 0 0 1 1-1zM11 18h2"/></symbol>
+<symbol id="i-loader" viewBox="0 0 24 24"><path d="M12 3a9 9 0 1 0 9 9"/></symbol>
+<symbol id="i-offline" viewBox="0 0 24 24"><path d="M2 2l20 20M8.5 16.5a5 5 0 0 1 7 0M5 13a10 10 0 0 1 5.2-2.7M19 13a10 10 0 0 0-2.3-1.6M2 8.8a15 15 0 0 1 4.2-2.6M22 8.8a15 15 0 0 0-11.2-3.7M12 20h.01"/></symbol>
+<symbol id="i-lock" viewBox="0 0 24 24"><path d="M5 11h14v10H5zM8 11V7a4 4 0 0 1 8 0v4"/></symbol>
+<symbol id="i-key" viewBox="0 0 24 24"><circle cx="7.5" cy="15.5" r="4.5"/><path d="M10.7 12.3L21 2M15.5 7.5l3 3M18 5l2 2"/></symbol>
+<symbol id="i-copy" viewBox="0 0 24 24"><path d="M9 9h11v11H9zM5 15H4a1 1 0 0 1-1-1V4a1 1 0 0 1 1-1h10a1 1 0 0 1 1 1v1"/></symbol>
+<symbol id="i-search" viewBox="0 0 24 24"><circle cx="11" cy="11" r="7"/><path d="M21 21l-4.3-4.3"/></symbol>
+<symbol id="i-plus" viewBox="0 0 24 24"><path d="M12 5v14M5 12h14"/></symbol>
+<symbol id="i-users" viewBox="0 0 24 24"><circle cx="9" cy="8" r="4"/><path d="M2 21a7 7 0 0 1 14 0M16 3.5a4 4 0 0 1 0 7.5M22 21a7 7 0 0 0-4.5-6.5"/></symbol>
+<symbol id="i-toggle" viewBox="0 0 24 24"><rect x="2" y="6" width="20" height="12" rx="6"/><circle cx="16" cy="12" r="3"/></symbol>
+<symbol id="i-down" viewBox="0 0 24 24"><path d="M12 5v14M5 12l7 7 7-7"/></symbol>
+</svg>
+
+<div class="app">
+<aside class="side" id="side" aria-label="导航">
+  <div class="brand"><span class="bar"></span><strong>微信连接器</strong><span class="ver" id="ver"></span>
+    <button class="icon-btn close" id="sideclose" type="button" aria-label="关闭菜单"><svg class="i" aria-hidden="true"><use href="#i-x"/></svg></button></div>
+  <nav class="nav" aria-label="页面">
+    <a href="#overview" data-tab="overview"><svg class="i" aria-hidden="true"><use href="#i-grid"/></svg><span>概览</span><i></i></a>
+    <a href="#setup" data-tab="setup" hidden><svg class="i" aria-hidden="true"><use href="#i-spark"/></svg><span>首次配置</span><i></i></a>
+    <a href="#login" data-tab="login"><svg class="i" aria-hidden="true"><use href="#i-scan"/></svg><span>登录</span><i></i></a>
+    <a href="#settings" data-tab="settings"><svg class="i" aria-hidden="true"><use href="#i-sliders"/></svg><span>设置</span><i></i></a>
+    <a href="#log" data-tab="log"><svg class="i" aria-hidden="true"><use href="#i-term"/></svg><span>日志</span><i></i></a>
   </nav>
+  <p class="side-note setup-only">配好之前只有这两页；概览和设置会在切到正常模式后出现。</p>
+  <div class="side-foot">
+    <button class="pill-btn" id="theme" type="button" title="页面主题：跟随系统、浅色、深色轮换"><svg class="i" aria-hidden="true"><use href="#i-sun"/></svg>主题：<span id="themename">跟随系统</span></button>
+    <a class="pill-btn" href="../"><svg class="i" aria-hidden="true"><use href="#i-monitor"/></svg>打开网页桌面</a>
+  </div>
+</aside>
+<div class="scrim" id="scrim" hidden></div>
+
+<main class="main">
+  <header class="topbar">
+    <button class="icon-btn" id="menu" type="button" aria-label="显示或收起侧栏" aria-controls="side"><svg class="i" aria-hidden="true"><use href="#i-menu"/></svg></button>
+    <h1 id="title">概览</h1>
+    <span class="status warn" id="overall"><span class="dot live"></span><span id="overalltext">读取中</span></span>
+    <span class="stamp" id="stamp"></span>
+  </header>
+  <div class="wrap">
 
   <section id="tab-overview" class="tab">
-    <div class="grid">
-      <section class="card">
-        <h2>状态</h2>
-        <div id="checks"></div>
-        <div class="actions" style="margin-top:10px">
-          <button id="pause" title="暂停期间 AstrBot 要发的消息会被拒，恢复后也不补发">暂停发送</button>
-          <button id="test" title="给「文件传输助手」发一条固定的测试消息">发测试消息</button>
-          <button id="restart" title="重新读配置和密钥；正在发消息时不重启">重启连接器</button>
-          <button id="notify">开启掉线通知</button>
+    <div class="ov-top">
+      <div class="ov-left">
+        <section class="card account" aria-label="小号">
+          <svg class="i watermark" aria-hidden="true"><use href="#i-bubble"/></svg>
+          <span class="avatar"><svg class="i" aria-hidden="true"><use href="#i-bubble"/></svg><span class="online" id="acc-dot"></span></span>
+          <div class="who"><strong>微信小号</strong><span id="acc-id">OneBot 号 —</span></div>
+          <span class="chip" id="acc-chip">读取中</span>
+        </section>
+        <section class="card grow" aria-labelledby="h-run">
+          <h2 id="h-run"><svg class="i" aria-hidden="true"><use href="#i-info"/></svg>运行信息</h2>
+          <dl class="kv" id="run"></dl>
+          <div class="card-foot">
+            <button class="btn small" id="restart" type="button" title="重新读配置和密钥；正在发消息时不重启"><svg class="i" aria-hidden="true"><use href="#i-restart"/></svg>重启连接器</button>
+            <button class="btn small" id="notify" type="button">开启掉线通知</button>
+          </div>
+        </section>
+      </div>
+      <section class="card ov-link" aria-label="连接与发送">
+        <div class="ov-info">
+          <h2><svg class="i" aria-hidden="true"><use href="#i-link"/></svg>AstrBot</h2>
+          <dl class="grid2">
+            <div class="wide"><dt>地址</dt><dd class="mono" id="ab-url-v">—</dd></div>
+            <div><dt>状态</dt><dd id="ab-state-v">—</dd></div>
+            <div><dt>启动后断开</dt><dd class="mono" id="ab-drops">—</dd></div>
+            <div><dt>口令</dt><dd id="ab-token-v">—</dd></div>
+            <div><dt>没连上时暂存</dt><dd class="mono" id="ab-buf">—</dd></div>
+          </dl>
+          <div class="sep"></div>
+          <h2><svg class="i" aria-hidden="true"><use href="#i-send"/></svg>发送</h2>
+          <dl class="grid2">
+            <div><dt>状态</dt><dd id="sd-state">—</dd></div>
+            <div><dt>排队</dt><dd class="mono" id="sd-queue">—</dd></div>
+            <div><dt>这一分钟已发</dt><dd class="mono" id="sd-minute">—</dd></div>
+            <div><dt>只收不发</dt><dd id="sd-ro">—</dd></div>
+          </dl>
+          <div class="actions">
+            <button class="btn primary" id="test" type="button"><svg class="i" aria-hidden="true"><use href="#i-send"/></svg>发测试消息</button>
+            <button class="btn" id="pause" type="button" title="暂停期间 AstrBot 要发的消息会被拒，恢复后也不补发"><svg class="i" aria-hidden="true"><use href="#i-pause"/></svg>暂停发送</button>
+            <span class="sub" id="testhint">测试消息只发给「文件传输助手」</span>
+          </div>
+        </div>
+        <div class="rings">
+          <div class="ring"><svg viewBox="0 0 120 120" aria-hidden="true"><circle class="track" id="r1-track" cx="60" cy="60" r="50"/><circle class="val" id="r1-val" cx="60" cy="60" r="50"/></svg>
+            <div class="txt"><span>检查通过</span><strong id="r1-num">–</strong></div></div>
+          <div class="ring"><svg viewBox="0 0 120 120" aria-hidden="true"><circle class="track" id="r2-track" cx="60" cy="60" r="50"/><circle class="val" id="r2-val" cx="60" cy="60" r="50"/></svg>
+            <div class="txt"><span>发送限速占用</span><strong id="r2-num">–</strong></div></div>
         </div>
       </section>
-      <section class="card"><h2>收发计数（启动以来）</h2><table class="kv" id="counts"></table></section>
     </div>
-    <div class="grid">
-      <section class="card scroll"><h2>最近发送</h2><table id="sends"></table></section>
-      <section class="card"><h2>配置</h2><table class="kv" id="config"></table></section>
+    <section class="tiles" aria-label="收发数字（启动以来）">
+      <div class="card tile"><strong id="t-recv">–</strong><span>收到消息</span></div>
+      <div class="card tile"><strong id="t-sent">–</strong><span>发出消息</span></div>
+      <div class="card tile"><strong id="t-fail">–</strong><span><i class="mark"></i>发送失败</span></div>
+      <div class="card tile"><strong id="t-queue">–</strong><span>排队</span></div>
+      <div class="card tile"><strong id="t-skip">–</strong><span>跳过的消息</span></div>
+    </section>
+    <div class="ov-mid">
+      <section class="card checks-card" aria-labelledby="h-checks">
+        <div class="head"><h2 id="h-checks"><svg class="i" aria-hidden="true"><use href="#i-shield"/></svg>检查项</h2><span class="sub" id="checks-sum">每 5 秒刷新</span></div>
+        <ul class="checks" id="checks"></ul>
+      </section>
+      <section class="card counts-card" aria-labelledby="h-counts">
+        <div class="head"><h2 id="h-counts"><svg class="i" aria-hidden="true"><use href="#i-bars"/></svg>收发计数</h2><span class="sub">启动以来</span></div>
+        <h3 class="group">收到</h3><ul class="bars" id="bars-recv"></ul>
+        <h3 class="group">跳过和发送</h3><ul class="bars" id="bars-other"></ul>
+      </section>
     </div>
+    <section class="card" aria-labelledby="h-sends">
+      <div class="head"><h2 id="h-sends"><svg class="i" aria-hidden="true"><use href="#i-history"/></svg>最近发送</h2><span class="sub">最近 12 条 · 只记长度和类型，不记内容</span></div>
+      <div class="sends"><ul id="sends"></ul></div>
+    </section>
   </section>
 
   <section id="tab-setup" class="tab">
-    <section class="card">
-      <h2>首次配置</h2>
-      <p>还没有 <code>config.json</code> 或 <code>keys.json</code>，所以连接器先只开这个页面，不收也不发。
+    <section class="card" aria-label="进度">
+      <p class="lead" style="margin-top:0">还没有 <code>config.json</code> 或 <code>keys.json</code>，所以连接器先只开这个页面，不收也不发。
         两份都有了会自动切到正常模式（十几秒），然后去「设置」填白名单。</p>
-      <div id="setupchecks"></div>
+      <ol class="stepper">
+        <li id="st1"><span class="num">1</span><span><strong>扫码登录，同时抓密钥</strong><span class="st-text">读取中</span></span></li>
+        <li id="st2"><span class="num">2</span><span><strong>填 AstrBot 地址和口令</strong><span class="st-text">读取中</span></span></li>
+        <li id="st3"><span class="num">3</span><span><strong>自动切到正常模式</strong><span class="st-text">前两步做完，十几秒内自己切</span></span></li>
+      </ol>
+      <ul class="checks compact" id="setupchecks"></ul>
     </section>
-    <h3 class="step">1. 扫码登录，同时抓密钥</h3>
-    <div class="grid" id="step1"></div>
-    <h3 class="step">2. 填 AstrBot 地址和口令</h3>
-    <div class="grid" id="step2"></div>
+    <section class="card" aria-labelledby="h-s1">
+      <div class="head"><h2 id="h-s1"><span class="stepno">1</span>扫码登录，同时抓密钥</h2><span class="chip" id="s1chip">读取中</span></div>
+      <div class="row nested" id="step1"></div>
+    </section>
+    <section class="card" aria-labelledby="h-s2">
+      <div class="head"><h2 id="h-s2"><span class="stepno">2</span>填 AstrBot 地址和口令</h2><span class="chip" id="s2chip">读取中</span></div>
+      <div class="nested" id="step2"></div>
+    </section>
+    <div class="note-dashed"><svg class="i" aria-hidden="true"><use href="#i-info"/></svg>两份都有了，连接器会在十几秒内切到正常模式，这页会自己重新载入成「概览」。</div>
   </section>
 
   <section id="tab-login" class="tab">
-    <div class="grid" id="loginslot">
-      <section class="card" id="logincard">
-        <h2>扫码登录</h2>
-        <p>现在：<span id="loginstate" class="muted">读取中</span></p>
-        <div class="actions">
-          <button id="qrbtn" class="primary" disabled>显示二维码</button>
-          <span class="hint">只截微信的登录窗口；已经登录、或者旁边开着别的微信窗口时不截图</span>
+    <div class="row">
+      <section class="card login-card" id="logincard" aria-labelledby="h-qr">
+        <div class="head"><h2 id="h-qr"><svg class="i" aria-hidden="true"><use href="#i-scan"/></svg>扫码登录</h2>
+          <span class="live" id="qrlive" hidden><span class="dot live"></span><span id="qrlivetext">每 3 秒更新一次</span></span></div>
+        <div class="banner" id="loginbanner"><span id="loginicon"></span><div><strong id="loginstate">读取中</strong><span id="loginsub" hidden></span></div></div>
+        <div class="qrstage" id="qrbox" hidden><div class="qrframe"><img id="qr" alt="微信登录窗口截图，用小号扫码"></div></div>
+        <div class="qrempty" id="qrempty"><svg class="i" aria-hidden="true"><use href="#i-scan"/></svg><span id="qremptytext">点「显示二维码」才开始截图，之后每 3 秒刷新一次</span></div>
+        <div class="actions center">
+          <button class="btn primary" id="qrbtn" type="button" disabled>显示二维码</button>
+          <a class="btn" href="../"><svg class="i" aria-hidden="true"><use href="#i-monitor"/></svg>在网页桌面里扫</a>
         </div>
-        <div id="qrbox" class="qr" hidden>
-          <img id="qr" alt="微信登录窗口截图">
-          <p class="hint" id="qrnote" style="margin-top:6px">每 3 秒更新一次，用小号扫码</p>
-        </div>
+        <p class="foot-note"><svg class="i" aria-hidden="true"><use href="#i-lock"/></svg><span>只截微信的登录窗口：认不出是登录窗口、已经登录了、或者旁边开着别的微信窗口时，一律不截。</span></p>
       </section>
-      <section class="card" id="keycard">
-        <h2>抓密钥</h2>
-        <p class="run-only muted">数据库：<span id="dbstate">读取中</span></p>
-        <p class="run-only">只是重新登录（没换号、手机上没退出）一般不用重抓密钥；数据库标红「密钥不能用」时按下面做：</p>
-        <p class="setup-only">新版微信只在登录那一刻派生数据库密钥，所以要先挂上断点再扫码。微信已经登录的话，先在手机上退出这台电脑上的登录，等出现二维码再做：</p>
-        <ol>
-          <li>在电脑的终端里运行，等它提示「现在扫码登录」：<br><code id="cmd1">docker exec -u 0 wechat /usr/bin/python3 /opt/wechat-connector/wxkey.py capture</code>
-            <button data-copy="cmd1">复制</button></li>
-          <li>用小号扫「扫码登录」里的二维码（也可以<a href="../">打开网页桌面</a>扫）。</li>
-          <li>抓到后运行，看到「校验通过 N/N 个库」就成功了：<br><code id="cmd2">docker exec -u 0 wechat /usr/bin/python3 /opt/wechat-connector/wxkey.py verify</code>
-            <button data-copy="cmd2">复制</button></li>
-          <li class="run-only">回到这里点<button id="restart2">重启连接器</button>，让它读新密钥。</li>
-          <li class="setup-only">成功后这里会把「密钥」标绿；两份文件都齐了会自动切到正常模式。</li>
+      <section class="card" id="keycard" aria-labelledby="h-key">
+        <h2 id="h-key"><svg class="i" aria-hidden="true"><use href="#i-key"/></svg>抓密钥</h2>
+        <p class="lead run-only">数据库：<span id="dbstate">读取中</span></p>
+        <p class="lead run-only">只是重新登录（没换号、手机上没退出）一般不用重抓密钥；数据库标红「密钥不能用」时按下面做：</p>
+        <p class="lead setup-only">新版微信只在登录那一刻派生数据库密钥，所以要先挂上断点再扫码。微信已经登录的话，先在手机上退出这台电脑上的登录，等出现二维码再做：</p>
+        <ol class="steps">
+          <li><div class="stepbody"><span>在电脑的终端里运行，等它提示「现在扫码登录」：</span>
+            <div class="cmd"><code id="cmd1">docker exec -u 0 wechat /usr/bin/python3 /opt/wechat-connector/wxkey.py capture</code><button type="button" data-copy="cmd1"><svg class="i" aria-hidden="true"><use href="#i-copy"/></svg>复制</button></div></div></li>
+          <li><div class="stepbody"><span>用小号扫「扫码登录」里的二维码（也可以<a href="../">打开网页桌面</a>扫）。</span></div></li>
+          <li><div class="stepbody"><span>抓到后运行，看到「校验通过 N/N 个库」就成功了：</span>
+            <div class="cmd"><code id="cmd2">docker exec -u 0 wechat /usr/bin/python3 /opt/wechat-connector/wxkey.py verify</code><button type="button" data-copy="cmd2"><svg class="i" aria-hidden="true"><use href="#i-copy"/></svg>复制</button></div></div></li>
+          <li class="run-only"><div class="stepbody"><span>回到这里重启连接器，让它读新密钥：</span>
+            <button class="btn primary" id="restart2" type="button"><svg class="i" aria-hidden="true"><use href="#i-restart"/></svg>重启连接器</button></div></li>
+          <li class="setup-only"><div class="stepbody"><span>成功后上面的「密钥」会标绿；两份文件都齐了会自动切到正常模式。</span></div></li>
         </ol>
-        <p class="hint" style="margin-top:6px">抓密钥要 root 跑 gdb，连接器自己没这个权限，所以要在终端里运行。容器名不是 wechat 的话把命令里的换掉。</p>
+        <p class="hint">抓密钥要 root 跑 gdb，连接器自己没这个权限，所以要在终端里运行。容器名不是 wechat 的话把命令里的换掉。</p>
       </section>
     </div>
   </section>
 
   <section id="tab-settings" class="tab">
-    <div class="grid" id="astrbotslot">
-      <section class="card" id="astrbotcard">
-        <h2>连接 AstrBot</h2>
-        <div class="field block">
-          <label for="ab-url">反向 WebSocket 地址</label>
-          <input id="ab-url" class="wide" type="text" placeholder="ws://astrbot:6200/ws" spellcheck="false" autocomplete="off">
-          <div class="hint" id="ab-urlhint">AstrBot 容器名加平台里填的端口，比如 ws://astrbot:6200/ws</div>
+    <section class="card" id="astrbotcard" aria-labelledby="h-ab">
+      <div class="head"><h2 id="h-ab"><svg class="i" aria-hidden="true"><use href="#i-link"/></svg>连接 AstrBot</h2><span class="chip run-only" id="ab-chip">读取中</span></div>
+      <div class="fields">
+        <div>
+          <div class="fld"><label for="ab-url">反向 WebSocket 地址</label><input id="ab-url" type="text" placeholder="ws://astrbot:6200/ws" spellcheck="false" autocomplete="off"></div>
+          <p class="hint" id="ab-urlhint">AstrBot 容器名加平台里填的端口，比如 ws://astrbot:6200/ws</p>
         </div>
-        <div class="field block">
-          <label for="ab-token">口令（和 AstrBot 平台里填的一样）</label>
-          <input id="ab-token" class="wide" type="password" autocomplete="new-password" spellcheck="false">
-          <div class="hint">只写不读：页面上不显示已经保存的口令，留空就是不改</div>
+        <div>
+          <div class="fld"><span class="lab"><label for="ab-token">口令（和 AstrBot 平台里填的一样）</label><span class="tokset" id="ab-tokset" hidden><svg class="i" aria-hidden="true"><use href="#i-lock"/></svg>已设置</span></span>
+            <input id="ab-token" type="password" autocomplete="new-password" spellcheck="false"></div>
+          <p class="hint">只写不读：页面上不显示已经保存的口令，留空就是不改</p>
         </div>
-        <div class="field setup-only">
-          <label for="ab-ro">先只收不发（第一次部署建议开着，确认能收到消息再到「设置」里关掉）</label>
-          <input id="ab-ro" type="checkbox">
-        </div>
-        <div class="actions" style="margin-top:10px">
-          <button id="ab-save" class="primary">保存连接并重启</button>
-          <span class="hint run-only">保存后看「概览」的 AstrBot 一行：连不上会写原因</span>
-        </div>
+      </div>
+      <div class="check-row setup-only"><input id="ab-ro" type="checkbox"><label for="ab-ro"><strong>先只收不发</strong><span>第一次部署建议开着，确认能收到消息再到「设置」里关掉</span></label></div>
+      <div class="foot"><span class="sub run-only">保存后看「概览」的 AstrBot 一行：连不上会写原因</span><button class="btn primary" id="ab-save" type="button">保存连接并重启</button></div>
+    </section>
+    <div class="row run-only">
+      <section class="card" aria-labelledby="h-tg">
+        <div class="head"><h2 id="h-tg"><svg class="i" aria-hidden="true"><use href="#i-toggle"/></svg>收发开关</h2><span class="sub">改完在底部保存</span></div>
+        <h3 class="group">收</h3><ul class="toggles" id="tg-recv"><li class="empty">读取中</li></ul>
+        <h3 class="group">发</h3><ul class="toggles" id="tg-send"></ul>
       </section>
-      <section class="card run-only">
-        <h2>收发开关</h2>
-        <div id="toggles" class="muted">读取中</div>
+      <section class="card" aria-labelledby="h-num">
+        <div class="head"><h2 id="h-num"><svg class="i" aria-hidden="true"><use href="#i-sliders"/></svg>发送和收图</h2></div>
+        <div class="stack" id="numbers"></div>
       </section>
     </div>
-    <section class="card run-only">
-      <h2>白名单</h2>
-      <div id="lists"></div>
-      <div class="field block">
-        <label for="q">按名字查 wxid（备注名或昵称里带这几个字的好友和群）</label>
-        <div class="actions"><input id="q" type="text" placeholder="名字"><button id="find">查</button></div>
-        <div id="found"></div>
-      </div>
-      <div class="actions" style="margin-top:10px">
-        <button id="save" class="primary">保存并重启</button>
-        <span class="hint">收发开关和白名单一起保存；保存前会留一份 config.json.bak</span>
+    <section class="card run-only" aria-labelledby="h-wl">
+      <div class="head"><h2 id="h-wl"><svg class="i" aria-hidden="true"><use href="#i-users"/></svg>白名单</h2><span class="sub">只有这一块会显示 wxid 和备注名</span></div>
+      <div class="lists" id="lists"></div>
+      <div class="lookup">
+        <div class="bar">
+          <div class="fld search-fld"><svg class="i" aria-hidden="true"><use href="#i-search"/></svg><div><label for="q">按名字查 wxid（备注名或昵称里带这几个字的好友和群）</label><input id="q" type="search" placeholder="名字" autocomplete="off"></div></div>
+          <button class="btn" id="find" type="button">查</button>
+        </div>
+        <ul class="found" id="found"></ul>
       </div>
     </section>
+    <div class="savebar run-only" id="savebar">
+      <span class="dot"></span><strong id="dirty">没有改动</strong>
+      <span class="sub">收发开关、数字和白名单一起保存；保存前会留一份 config.json.bak</span>
+      <button class="btn" id="reset" type="button" disabled>撤销改动</button>
+      <button class="btn primary" id="save" type="button" disabled>保存并重启</button>
+    </div>
   </section>
 
   <section id="tab-log" class="tab">
-    <section class="card">
-      <div class="logbar">
-        <select id="loglevel" aria-label="级别">
-          <option value="0">全部级别</option><option value="2">警告和错误</option><option value="3">只看错误</option>
-        </select>
-        <input id="logq" type="text" placeholder="筛选关键字" aria-label="关键字">
-        <select id="loglines" aria-label="行数">
-          <option value="200">最后 200 行</option><option value="500">最后 500 行</option>
-          <option value="1000">最后 1000 行</option><option value="2000">最后 2000 行</option>
-        </select>
-        <label><input id="follow" type="checkbox" checked> 跟到最新</label>
-        <span id="logcount" class="hint"></span>
+    <section class="card toolbar" aria-label="筛选">
+      <div class="seg" id="loglevel" role="group" aria-label="级别">
+        <button type="button" data-min="0" aria-pressed="true">全部</button>
+        <button type="button" data-min="2" aria-pressed="false">警告以上</button>
+        <button type="button" data-min="3" aria-pressed="false">只看错误</button>
       </div>
-      <div id="logbox" class="log">读取中</div>
+      <div class="search"><svg class="i" aria-hidden="true"><use href="#i-search"/></svg><input id="logq" type="search" placeholder="筛选关键字" aria-label="筛选关键字"></div>
+      <select id="loglines" aria-label="显示多少行">
+        <option value="200">最后 200 行</option><option value="500">最后 500 行</option>
+        <option value="1000">最后 1000 行</option><option value="2000">最后 2000 行</option>
+      </select>
+      <span class="follow"><label for="follow">跟到最新</label><button class="switch" id="follow" type="button" role="switch" aria-checked="true"></button></span>
+      <span id="logcount"></span>
+    </section>
+    <section class="term" aria-label="日志内容">
+      <div class="term-head"><span class="name"><svg class="i" aria-hidden="true"><use href="#i-term"/></svg>connector.log</span>
+        <span class="live"><span class="dot live" id="logdot"></span><span id="loglive">跟到最新 · 每 3 秒刷新</span></span></div>
+      <div class="logbody" id="logbox" tabindex="0">读取中</div>
+      <button class="btn primary small" id="tolatest" type="button" hidden><svg class="i" aria-hidden="true"><use href="#i-down"/></svg>回到最新</button>
     </section>
   </section>
+
+  </div>
 </main>
-<div id="notice"></div>
+</div>
+<div id="notice" role="status" aria-live="polite"></div>
 <script>
-const LEVEL = { ok: "正常", warn: "要留意", bad: "有问题" };
 const TOKEN = document.querySelector('meta[name="wxc-token"]').content;
 const TABS = { run: ["overview", "login", "settings", "log"], setup: ["setup", "log"] };
+const TITLES = { overview: "概览", setup: "首次配置", login: "登录", settings: "设置", log: "日志" };
+const WORD = { ok: "正常", warn: "注意", bad: "出错" };
+const MARK = { ok: "check", warn: "alert", bad: "x" };
+const COLOR = { ok: ["var(--ok-mark)", "var(--ok-bg)"], warn: ["var(--warn-mark)", "var(--warn-bg)"], bad: ["var(--bad-mark)", "var(--bad-bg)"] };
+const VOICE = { native: "原生语音条", file: "mp3 文件" };
+const FIX = {  // 检查项出问题时给一个去处
+  "微信窗口": c => c.text.includes("登录") && ["login", "去扫码"],
+  "数据库": c => c.text.includes("密钥") && ["login", "去抓密钥"],
+  "AstrBot": c => c.level === "bad" && ["settings", "去设置"],
+};
 const $ = id => document.getElementById(id);
-let mode = "", busy = false, alerting = false, settings = null, qrOn = false, logLines = [];
+const narrow = window.matchMedia("(max-width: 899px)");
+let mode = "", busy = false, alerting = false, leaving = false, qrOn = false;
+let settings = null, edit = null, names = {};
+const drawList = {};
+let logLines = [], logMin = 0, follow = true;
 
 function el(tag, cls, text) {
   const e = document.createElement(tag);
@@ -849,11 +1320,16 @@ function el(tag, cls, text) {
   if (text !== undefined) e.textContent = String(text);
   return e;
 }
-function row(cells, head) {
-  const tr = el("tr");
-  cells.forEach(c => tr.appendChild(el(head ? "th" : "td", c && c.cls, c && typeof c === "object" ? c.text : c)));
-  return tr;
+function icon(name, size) {
+  const ns = "http://www.w3.org/2000/svg", s = document.createElementNS(ns, "svg"), u = document.createElementNS(ns, "use");
+  s.setAttribute("class", "i");
+  s.setAttribute("aria-hidden", "true");
+  if (size) { s.style.width = size + "px"; s.style.height = size + "px"; }
+  u.setAttribute("href", "#i-" + name);
+  s.append(u);
+  return s;
 }
+function label(btn, name, text) { btn.replaceChildren(icon(name), document.createTextNode(text)); }
 function notice(text) {
   const n = $("notice");
   n.textContent = text; n.style.display = "block";
@@ -873,22 +1349,51 @@ async function post(path, data) {
   return j;
 }
 function afterRestart() {
+  leaving = true;
   notice("连接器正在重启，过一会儿自动刷新页面");
   setTimeout(() => location.reload(), mode === "setup" ? 5000 : 12000);
 }
+function clock(ts) { return new Date(ts * 1000).toLocaleTimeString("zh-CN", { hour12: false }); }
+function setOverall(level, text) { $("overall").className = "status " + level; $("overalltext").textContent = text; }
+function setChip(chip, level, text) { chip.className = "chip " + level; chip.textContent = text; }
+function stateText(dd, level, text) {
+  const s = el("span", "state " + level);
+  s.append(el("span", "dot"), document.createTextNode(text));
+  dd.replaceChildren(level ? s : document.createTextNode(text));
+}
 
-// ---------- 主题 ----------
-const THEMES = ["auto", "light", "dark"], THEME_NAME = { auto: "自动", light: "浅色", dark: "深色" };
+// ---------- 主题、侧栏 ----------
+const THEMES = ["auto", "light", "dark"], THEME_NAME = { auto: "跟随系统", light: "浅色", dark: "深色" };
 function theme() { try { return localStorage.getItem("wxc-theme") || "auto"; } catch (e) { return "auto"; } }
 function applyTheme(t) {
   if (t === "auto") delete document.documentElement.dataset.theme; else document.documentElement.dataset.theme = t;
-  $("theme").textContent = "主题：" + THEME_NAME[t];
+  $("themename").textContent = THEME_NAME[t];
 }
 $("theme").onclick = () => {
   const t = THEMES[(THEMES.indexOf(theme()) + 1) % THEMES.length];
   try { localStorage.setItem("wxc-theme", t); } catch (e) {}
   applyTheme(t);
 };
+function syncMenu() {
+  const open = narrow.matches ? document.body.classList.contains("drawer") : !document.documentElement.classList.contains("side-off");
+  $("menu").setAttribute("aria-expanded", String(open));
+}
+function setDrawer(open) {
+  document.body.classList.toggle("drawer", open);
+  $("scrim").hidden = !open;
+  syncMenu();
+}
+$("menu").onclick = () => {
+  if (narrow.matches) { setDrawer(!document.body.classList.contains("drawer")); return; }
+  const off = document.documentElement.classList.toggle("side-off");  // 宽屏：收起或展开侧栏，记在本机浏览器里
+  try { localStorage.setItem("wxc-side", off ? "0" : "1"); } catch (e) {}
+  syncMenu();
+};
+$("scrim").onclick = () => setDrawer(false);
+$("sideclose").onclick = () => setDrawer(false);
+document.querySelectorAll(".nav a").forEach(a => a.addEventListener("click", () => setDrawer(false)));  // 点的是当前页时不触发 hashchange
+narrow.addEventListener("change", () => setDrawer(false));
+document.addEventListener("keydown", e => { if (e.key === "Escape" && document.body.classList.contains("drawer")) setDrawer(false); });
 
 // ---------- 标签 ----------
 function currentTab() {
@@ -897,8 +1402,14 @@ function currentTab() {
 }
 function showTab() {
   const t = currentTab();
-  document.querySelectorAll("nav.tabs a").forEach(a => a.classList.toggle("on", a.dataset.tab === t));
+  document.querySelectorAll(".nav a").forEach(a => {
+    const on = a.dataset.tab === t;
+    a.classList.toggle("on", on);
+    if (on) a.setAttribute("aria-current", "page"); else a.removeAttribute("aria-current");
+  });
   document.querySelectorAll(".tab").forEach(s => s.classList.toggle("on", s.id === "tab-" + t));
+  $("title").textContent = TITLES[t];
+  setDrawer(false);
   if (t === "log") refreshLog();
   if (t === "login" || t === "setup") refreshLogin(); else stopQr();
   if ((t === "settings" || t === "setup") && !settings) loadSettings();
@@ -906,9 +1417,10 @@ function showTab() {
 window.addEventListener("hashchange", () => { window.scrollTo(0, 0); showTab(); });
 function setMode(m) {
   if (m === mode) return;
+  if (mode === "setup") { leaving = true; location.reload(); return; }  // 首次配置做完切到正常模式：口令换了、卡片也要挪回去，直接重新载入
   mode = m;
   document.body.classList.toggle("setup", m === "setup");
-  document.querySelectorAll("nav.tabs a").forEach(a => { a.hidden = !TABS[m].includes(a.dataset.tab); });
+  document.querySelectorAll(".nav a").forEach(a => { a.hidden = !TABS[m].includes(a.dataset.tab); });
   if (m === "setup") {  // 首次配置：把登录、抓密钥、连接 AstrBot 三张卡片挪进「首次配置」
     $("step1").append($("logincard"), $("keycard"));
     $("step2").append($("astrbotcard"));
@@ -942,7 +1454,7 @@ $("test").onclick = async () => {
 function alertPref() { try { return localStorage.getItem("wxc-notify") === "1"; } catch (e) { return false; } }
 function showNotifyButton() {
   const on = alertPref() && "Notification" in window && Notification.permission === "granted";
-  $("notify").textContent = on ? "关闭掉线通知" : "开启掉线通知";
+  label($("notify"), "bell", on ? "关闭掉线通知" : "开启掉线通知");
 }
 $("notify").onclick = async () => {
   if (!("Notification" in window)) { notice("这个浏览器不支持通知"); return; }
@@ -962,76 +1474,195 @@ function checkAlert(s) {
   }
   alerting = now;
 }
-function renderChecks(box, checks) {
+function renderChecks(box, checks, links) {
   box.replaceChildren(...checks.map(c => {
-    const d = el("div", "check");
-    d.append(el("span", "dot " + c.level), el("b", "", c.name), el("span", "", c.text));
-    return d;
+    const li = el("li"), ic = el("span", "ic " + c.level), body = el("div", "body");
+    ic.append(icon(MARK[c.level]));
+    body.append(el("b", "", c.name), el("span", "", c.text));
+    const fix = links && c.level !== "ok" && FIX[c.name] && FIX[c.name](c);
+    if (fix) { const a = el("a", "go", fix[1] + " →"); a.href = "#" + fix[0]; body.append(a); }
+    li.append(ic, body, el("span", "chip " + c.level, WORD[c.level]));
+    return li;
   }));
+}
+function setRing(n, frac, color, track, num, unit) {
+  const v = $("r" + n + "-val");
+  frac = Math.max(0, Math.min(1, frac || 0));
+  v.style.strokeDasharray = (frac * 314.16).toFixed(1) + " 314.16";
+  v.style.visibility = frac > 0 ? "visible" : "hidden";
+  v.style.stroke = color;
+  $("r" + n + "-track").style.stroke = track;
+  $("r" + n + "-num").replaceChildren(document.createTextNode(num), el("small", "", unit));
+}
+function renderCounts(counts) {
+  const recv = [], other = [];
+  Object.entries(counts).forEach(([k, v]) => (k.startsWith("私聊·") || k.startsWith("群·") ? recv : other).push([k, v]));
+  recv.sort((a, b) => b[1] - a[1]);
+  const max = Math.max(1, ...recv.map(x => x[1]), ...other.map(x => x[1]));
+  const draw = (list, box) => box.replaceChildren(...(list.length ? list.map(([k, v]) => {
+    const li = el("li"), track = el("span", "track"), fill = el("span", "fill");
+    li.title = k + "：" + v + " 条";
+    fill.style.width = Math.max(2, Math.round(v / max * 100)) + "%";
+    if (k === "发送失败") fill.style.background = "var(--bad-mark)";
+    else if (k.startsWith("跳过·")) fill.style.background = "var(--switch-off)";
+    track.append(fill);
+    li.append(el("span", "name", k), track, el("span", "n", v));
+    return li;
+  }) : [el("li", "empty", "还没有")]));
+  draw(recv, $("bars-recv"));
+  draw(other, $("bars-other"));
+}
+function renderSends(list) {
+  const head = el("li", "headrow");
+  head.setAttribute("aria-hidden", "true");
+  ["时间", "发给", "内容", "结果"].forEach(x => head.append(el("span", "", x)));
+  $("sends").replaceChildren(head, ...(list.length ? list.map(x => {
+    const li = el("li"), res = el("span", "res " + (x.ok ? "ok" : "bad"));
+    res.append(icon(x.ok ? "check" : "x"), el("span", "", x.ok ? "已发出" : "没发出：" + (x.reason || "失败")));
+    li.append(el("span", "t", x.ago + "前"), el("span", "to", x.to), el("span", "what", x.what), res);
+    return li;
+  }) : [el("li", "empty", "启动后还没发过")]));
+}
+function renderOverview(s) {
+  const w = s.wechat, a = s.astrbot, sd = s.send, cfg = s.config;
+  const acc = !w.running ? ["bad", "微信没在运行"] : w.login ? ["warn", "停在登录窗口"] : !w.checked ? ["", "还没查过"]
+    : w.window ? ["ok", "已登录"] : ["bad", "找不到窗口"];
+  $("acc-dot").className = "online " + acc[0];
+  setChip($("acc-chip"), acc[0], acc[1]);
+  $("acc-id").textContent = "OneBot 号 " + s.self_id;
+  $("run").replaceChildren(...[["版本", s.version], ["已运行", s.uptime], ["私聊", cfg["私聊"]], ["群", cfg["群"]],
+    ["语音", VOICE[cfg["语音"]] || cfg["语音"]]].map(([k, v]) => { const d = el("div"); d.append(el("dt", "", k), el("dd", "", v)); return d; }));
+
+  $("ab-url-v").textContent = a.url;
+  if (s.receive_only) stateText($("ab-state-v"), "", "只收不发，不连");
+  else if (a.connected) stateText($("ab-state-v"), "ok", "已连上 " + a.since);
+  else stateText($("ab-state-v"), "bad", "已经 " + a.since + "没连上：" + a.error);
+  $("ab-drops").textContent = a.disconnects + " 次";
+  $("ab-token-v").textContent = a.token_set ? "已设置" : "没设置";
+  $("ab-buf").textContent = a.buffered + " 条";
+  if (sd.paused) stateText($("sd-state"), "warn", "已暂停");
+  else stateText($("sd-state"), "", sd.sending ? "正在发" : sd.queued ? "排队中" : "空闲");
+  $("sd-queue").textContent = sd.queued + " 条";
+  $("sd-minute").textContent = sd.last_minute + " / " + sd.per_minute + " 条";
+  $("sd-ro").textContent = s.receive_only ? "开" : "关";
+  const pause = $("pause");
+  pause.dataset.paused = s.paused ? "1" : "0";
+  label(pause, s.paused ? "play" : "pause", s.paused ? "恢复发送" : "暂停发送");
+  const why = s.receive_only ? "只收不发模式不发消息" : s.paused ? "已暂停发送" : s.test_pending ? "上一条测试消息还没发完" : "";
+  $("test").disabled = !!why;
+  $("test").title = why || "给「文件传输助手」发一条固定的测试消息";
+  $("testhint").textContent = why || "测试消息只发给「文件传输助手」";
+
+  const okN = s.checks.filter(c => c.level === "ok").length, total = s.checks.length;
+  setRing(1, okN / total, COLOR[s.level][0], COLOR[s.level][1], okN, "/" + total);
+  const pct = sd.per_minute ? Math.round(sd.last_minute / sd.per_minute * 100) : 0;
+  const rc = pct >= 80 ? COLOR.warn : ["var(--accent)", "var(--accent-soft)"];
+  setRing(2, pct / 100, rc[0], rc[1], Math.min(pct, 100), "%");
+
+  const counts = s.counts;
+  const sum = pre => Object.entries(counts).filter(([k]) => pre.some(p => k.startsWith(p))).reduce((n, [, v]) => n + v, 0);
+  $("t-recv").textContent = sum(["私聊·", "群·"]);
+  $("t-sent").textContent = counts["发出"] || 0;
+  $("t-fail").textContent = counts["发送失败"] || 0;
+  $("t-queue").textContent = sd.queued;
+  $("t-skip").textContent = sum(["跳过·"]);
+  $("checks-sum").textContent = (okN < total ? okN + " 项正常 · " + (total - okN) + " 项要看" : total + " 项都正常") + " · 每 5 秒刷新";
+  renderChecks($("checks"), s.checks, true);
+  renderCounts(counts);
+  renderSends(s.recent_sends);
+
+  const db = s.checks.find(c => c.name === "数据库");
+  if (db) { $("dbstate").className = "state " + db.level; $("dbstate").textContent = db.text; }
+  if (s.receive_only) setChip($("ab-chip"), "", "只收不发，不连");
+  else if (a.connected) setChip($("ab-chip"), "ok", "已连上 " + a.since);
+  else setChip($("ab-chip"), "bad", "没连上：" + a.error);
+}
+function setStep(n, done, now, text) {
+  const li = $("st" + n);
+  li.className = done ? "done" : now ? "now" : "";
+  li.querySelector(".num").replaceChildren(done ? icon("check") : document.createTextNode(n));
+  li.querySelector(".st-text").textContent = text;
+}
+function renderSetup(s) {
+  document.title = "首次配置 · 微信连接器";
+  renderChecks($("setupchecks"), s.checks, false);
+  const keys = !!s.files["keys.json"];
+  const conf = !!s.files["config.json"] && !s.checks.some(c => c.name === "配置" && c.level === "bad");
+  const left = (keys ? 0 : 1) + (conf ? 0 : 1);
+  setOverall(left ? "warn" : "ok", left ? "首次配置 · 还差 " + left + " 步" : "首次配置 · 马上切到正常模式");
+  setStep(1, keys, !keys, keys ? "keys.json 已经有了" : "还没有 keys.json");
+  setStep(2, conf, keys && !conf, conf ? "config.json 已经有了" : "还没有 config.json");
+  setStep(3, false, keys && conf, keys && conf ? "马上就切" : "前两步做完，十几秒内自己切");
+  setChip($("s1chip"), keys ? "ok" : "accent", keys ? "做完了" : "正在做");
+  setChip($("s2chip"), conf ? "ok" : keys ? "accent" : "", conf ? "做完了" : keys ? "正在做" : "还没填");
 }
 async function refresh() {
   let s;
   try { s = await getJSON("api/status"); }
   catch (e) {
-    $("overall").className = "pill bad"; $("overall").textContent = "连接器没响应";
+    setOverall("bad", "连接器没响应");
     document.title = "⚠ 没响应 · 微信连接器";
     return;
   }
   setMode(s.mode);
+  if (mode !== s.mode) return;  // 正在重新载入
   busy = s.busy;
-  $("meta").textContent = "版本 " + s.version + " · 已运行 " + s.uptime;
-  if (s.mode === "setup") {
-    $("overall").className = "pill warn"; $("overall").textContent = "首次配置";
-    document.title = "首次配置 · 微信连接器";
-    renderChecks($("setupchecks"), s.checks);
-    return;
-  }
-  $("overall").className = "pill " + s.level; $("overall").textContent = LEVEL[s.level];
+  $("ver").textContent = s.version;
+  $("stamp").textContent = clock(s.now) + " 刷新";
+  if (s.mode === "setup") { renderSetup(s); return; }
+  const bad = s.checks.filter(c => c.level === "bad"), warn = s.checks.filter(c => c.level === "warn");
+  setOverall(s.level, bad.length ? bad.length + " 项出错：" + bad.map(c => c.name).join("、")
+    : warn.length ? warn.length + " 项要留意" : "一切正常");
   checkAlert(s);
-  renderChecks($("checks"), s.checks);
-  const pause = $("pause");
-  pause.dataset.paused = s.paused ? "1" : "0";
-  pause.textContent = s.paused ? "恢复发送" : "暂停发送";
-  const test = $("test");
-  test.disabled = s.receive_only || s.paused || s.test_pending;
-  test.title = s.receive_only ? "只收不发模式不发消息" : s.paused ? "已暂停发送" : s.test_pending ? "上一条测试消息还没发完"
-    : "给「文件传输助手」发一条固定的测试消息";
-  const db = s.checks.find(c => c.name === "数据库");
-  if (db) { $("dbstate").className = db.level; $("dbstate").textContent = db.text; }
-  const counts = Object.entries(s.counts);
-  $("counts").replaceChildren(...(counts.length ? counts.map(([k, v]) => row([k, v])) : [row(["还没有", ""])]));
-  $("sends").replaceChildren(row(["时间", "发给", "内容", "结果"], true),
-    ...(s.recent_sends.length ? s.recent_sends.map(x => row([x.ago + "前", x.to, x.what,
-      x.ok ? { cls: "ok", text: "发出" } : { cls: "bad", text: x.reason || "失败" }])) : [row(["启动后还没发过", "", "", ""])]));
-  $("config").replaceChildren(...Object.entries(s.config).map(([k, v]) => row([k, v === true ? "开" : v === false ? "关" : v])));
+  renderOverview(s);
 }
 
 // ---------- 登录 ----------
+const LOGIN_LOOK = { qr: ["accent", "scan"], confirm: ["warn", "phone"], loading: ["accent", "loader"], offline: ["bad", "offline"] };
+function setBanner(cls, ic, title, sub) {
+  $("loginbanner").className = "banner " + cls;
+  $("loginicon").replaceChildren(icon(ic));
+  $("loginstate").textContent = title;
+  $("loginsub").textContent = sub;
+  $("loginsub").hidden = !sub;
+}
 function stopQr() {
   qrOn = false;
   $("qrbox").hidden = true;
+  $("qrempty").hidden = false;
+  $("qrlive").hidden = true;
   $("qrbtn").textContent = "显示二维码";
+  $("qrbtn").classList.add("primary");
 }
 $("qrbtn").onclick = () => {
   if (qrOn) { stopQr(); return; }
-  qrOn = true; $("qrbtn").textContent = "收起二维码";
+  qrOn = true;
+  $("qrbtn").textContent = "收起二维码";
+  $("qrbtn").classList.remove("primary");
   refreshLogin(true);
 };
-$("qr").onerror = () => { $("qrnote").textContent = "这次没截到，过几秒自动再试"; };
-$("qr").onload = () => { $("qrnote").textContent = "每 3 秒更新一次，用小号扫码"; };
+$("qr").onerror = () => { $("qrlivetext").textContent = "这次没截到，过几秒自动再试"; };
+$("qr").onload = () => { $("qrlivetext").textContent = "每 3 秒更新 · " + clock(Date.now() / 1000); $("qrlive").hidden = false; };
 async function refreshLogin(force) {
   let s;
-  try { s = await getJSON("api/login"); } catch (e) { $("loginstate").className = "bad"; $("loginstate").textContent = "读不到"; return; }
-  const line = $("loginstate");
-  line.className = s.login ? "warn" : s.running ? "ok" : "bad";
-  line.textContent = s.text + (s.login && s.others ? "（旁边还开着别的微信窗口，不截图，去网页桌面看）" : "");
+  try { s = await getJSON("api/login"); } catch (e) { setBanner("bad", "x", "读不到登录窗口的状态", ""); return; }
+  if (s.login) {
+    const look = LOGIN_LOOK[s.state] || LOGIN_LOOK.qr;
+    setBanner(look[0], look[1], s.text, s.others ? "旁边还开着别的微信窗口，不截图，去网页桌面看" : "微信停在登录窗口");
+  } else {
+    setBanner(s.running ? "ok" : "bad", s.running ? "check" : "x", s.text, "");
+  }
+  $("qremptytext").textContent = !s.login ? "没有登录窗口，不用扫码"
+    : s.others ? "旁边开着别的微信窗口，不截图" : "点「显示二维码」才开始截图，之后每 3 秒刷新一次";
   $("qrbtn").disabled = !s.login && !qrOn;
   if (!qrOn) return;
   if (s.login && !s.others) {
     $("qr").src = "api/login/qr?t=" + Date.now();
     $("qrbox").hidden = false;
+    $("qrempty").hidden = true;
   } else {
     $("qrbox").hidden = true;
+    $("qrempty").hidden = false;
     if (!s.login) { stopQr(); if (!force) notice("登录窗口没了：" + s.text); }
   }
 }
@@ -1041,48 +1672,149 @@ document.querySelectorAll("[data-copy]").forEach(b => b.onclick = async () => {
 });
 
 // ---------- 设置 ----------
+const SEND_KEYS = ["receive_only", "reply_mention_when_busy"];
+const LIST_HINT = { whitelist: "填 wxid；只填 * 就是所有好友", group_whitelist: "填群 id，以 @chatroom 结尾", bot_names: "群里有人这样叫，也算叫了小号" };
 function fillAstrbot(a) {
   $("ab-url").value = a.url;
   $("ab-url").disabled = a.locked;
   if (a.locked) $("ab-urlhint").textContent = "地址里带了参数或账号（可能有口令），页面上不显示全，也不能在这里改，要改请改 config.json";
   $("ab-token").value = "";
   $("ab-token").placeholder = a.token_set ? "已设置，留空不改" : "还没设置";
+  $("ab-tokset").hidden = !a.token_set;
   $("ab-ro").checked = a.receive_only;
 }
 async function loadSettings() {
-  const box = $("toggles");
-  try { settings = await getJSON("api/settings"); } catch (e) { box.textContent = "读不了设置"; return; }
+  try { settings = await getJSON("api/settings"); }
+  catch (e) { $("tg-recv").replaceChildren(el("li", "empty", "读不了设置")); return; }
   fillAstrbot(settings.astrbot);
-  if (settings.setup) return;
-  box.className = ""; box.replaceChildren();
-  settings.toggles.forEach(t => {
-    const f = el("div", "field"), cb = el("input"), lab = el("label", "", t.label);
-    cb.type = "checkbox"; cb.checked = t.value; cb.dataset.key = t.key; cb.dataset.kind = "toggle"; cb.id = "set-" + t.key;
-    lab.htmlFor = cb.id;
-    f.append(lab, cb); box.append(f);
+  if (!settings.setup) resetEdit();
+}
+function resetEdit() {
+  edit = { toggles: {}, numbers: {}, choices: {}, lists: {} };
+  names = {};
+  settings.toggles.forEach(t => { edit.toggles[t.key] = t.value; });
+  settings.numbers.forEach(n => { edit.numbers[n.key] = n.value; });
+  settings.choices.forEach(c => { edit.choices[c.key] = c.value; });
+  settings.lists.forEach(l => { edit.lists[l.key] = l.value.slice(); Object.assign(names, l.names); });
+  renderToggles();
+  renderNumbers();
+  renderLists();
+  renderDirty();
+}
+function changes() {
+  const out = {};
+  if (!edit) return out;
+  settings.toggles.forEach(t => { if (edit.toggles[t.key] !== t.value) out[t.key] = edit.toggles[t.key]; });
+  settings.numbers.forEach(n => { if (edit.numbers[n.key] !== n.value) out[n.key] = edit.numbers[n.key]; });
+  settings.choices.forEach(c => { if (edit.choices[c.key] !== c.value) out[c.key] = edit.choices[c.key]; });
+  settings.lists.forEach(l => { if (edit.lists[l.key].join("\n") !== l.value.join("\n")) out[l.key] = edit.lists[l.key]; });
+  return out;
+}
+function renderDirty() {
+  const n = Object.keys(changes()).length;
+  $("savebar").classList.toggle("dirty", n > 0);
+  $("dirty").textContent = n ? "有 " + n + " 处改动没保存" : "没有改动";
+  $("save").disabled = !n;
+  $("reset").disabled = !n;
+}
+function renderToggles() {
+  const row = t => {
+    const li = el("li"), lab = el("label", "", t.label), sw = el("button", "switch"), mark = el("span", "changed", "改了");
+    sw.type = "button";
+    sw.id = "tg-" + t.key;
+    sw.setAttribute("role", "switch");
+    lab.htmlFor = sw.id;
+    lab.append(mark);
+    const sync = () => { sw.setAttribute("aria-checked", String(edit.toggles[t.key])); mark.hidden = edit.toggles[t.key] === t.value; };
+    sw.onclick = () => { edit.toggles[t.key] = !edit.toggles[t.key]; sync(); renderDirty(); };
+    sync();
+    li.append(lab, sw);
+    return li;
+  };
+  $("tg-recv").replaceChildren(...settings.toggles.filter(t => !SEND_KEYS.includes(t.key)).map(row));
+  $("tg-send").replaceChildren(...settings.toggles.filter(t => SEND_KEYS.includes(t.key)).map(row));
+}
+function renderNumbers() {
+  const nums = settings.numbers.map(n => {
+    const f = el("div", "fld numfld"), d = el("div"), lab = el("label", "", n.label), inp = el("input");
+    inp.type = "number"; inp.min = n.min; inp.max = n.max; inp.step = 1; inp.value = n.value; inp.id = "num-" + n.key;
+    inp.inputMode = "numeric";
+    lab.htmlFor = inp.id;
+    inp.oninput = () => { edit.numbers[n.key] = inp.value === "" ? null : Number(inp.value); renderDirty(); };
+    d.append(lab, inp);
+    f.append(d, el("span", "range", n.min + "–" + n.max));
+    return f;
   });
-  settings.numbers.forEach(n => {
-    const f = el("div", "field"), i = el("input");
-    i.type = "number"; i.min = n.min; i.max = n.max; i.value = n.value; i.style.width = "90px";
-    i.dataset.key = n.key; i.dataset.kind = "number";
-    f.append(el("label", "", n.label + "（" + n.min + "～" + n.max + "）"), i); box.append(f);
+  const choices = settings.choices.map(c => {
+    const wrap = el("div"), lab = el("span", "choice-label", c.label), seg = el("div", "seg");
+    lab.id = "ch-" + c.key;
+    seg.setAttribute("role", "group");
+    seg.setAttribute("aria-labelledby", lab.id);
+    const btns = Object.entries(c.options).map(([v, text]) => {
+      const b = el("button", "", text);
+      b.type = "button";
+      b.onclick = () => { edit.choices[c.key] = v; btns.forEach(([x, bb]) => bb.setAttribute("aria-pressed", String(x === v))); renderDirty(); };
+      return [v, b];
+    });
+    btns.forEach(([v, b]) => { b.setAttribute("aria-pressed", String(edit.choices[c.key] === v)); seg.append(b); });
+    wrap.append(lab, seg);
+    return wrap;
   });
-  settings.choices.forEach(ch => {
-    const f = el("div", "field"), sel = el("select");
-    Object.entries(ch.options).forEach(([v, lab]) => { const o = el("option", "", lab); o.value = v; sel.append(o); });
-    sel.value = ch.value; sel.dataset.key = ch.key; sel.dataset.kind = "choice";
-    f.append(el("label", "", ch.label), sel); box.append(f);
-  });
-  const lists = $("lists");
-  lists.replaceChildren();
-  settings.lists.forEach(l => {
-    const f = el("div", "field block"), ta = el("textarea");
-    ta.value = l.value.join("\n"); ta.dataset.key = l.key; ta.dataset.kind = "list"; ta.id = "list-" + l.key;
-    const named = l.value.filter(x => l.names[x]).map(x => l.names[x]);
-    f.append(el("label", "", l.label), ta);
-    if (named.length) f.append(el("div", "hint", "现在有：" + named.join("、")));
-    lists.append(f);
-  });
+  $("numbers").replaceChildren(...nums, ...choices);
+}
+function renderLists() {
+  $("lists").replaceChildren(...settings.lists.map(l => {
+    const title = l.label.split("（")[0], chips = l.key === "bot_names";
+    const box = el("div", "lst"), top = el("div", "top"), count = el("span", "count"), items = el(chips ? "div" : "ul", chips ? "chips" : "");
+    const add = el("div", "add"), inp = el("input"), btn = el("button");
+    top.append(el("h3", "", title), count);
+    inp.type = "text"; inp.spellcheck = false; inp.autocomplete = "off";
+    inp.placeholder = l.key === "whitelist" ? "添加 wxid" : l.key === "group_whitelist" ? "添加 …@chatroom" : "添加名字";
+    inp.setAttribute("aria-label", "加到「" + title + "」");
+    if (!chips) inp.classList.add("mono");
+    btn.type = "button";
+    btn.setAttribute("aria-label", "加到「" + title + "」");
+    btn.append(icon("plus"));
+    const draw = () => {
+      const list = edit.lists[l.key];
+      count.textContent = list.length + " 个";
+      if (!list.length) { items.replaceChildren(el(chips ? "span" : "li", "empty", "还没有")); return; }
+      items.replaceChildren(...list.map(x => {
+        const rm = el("button", "x"), who = names[x] || "";
+        rm.type = "button";
+        rm.append(icon("x", 16));
+        rm.setAttribute("aria-label", "从「" + title + "」去掉 " + (who || x));
+        rm.onclick = () => { edit.lists[l.key] = edit.lists[l.key].filter(y => y !== x); draw(); renderDirty(); };
+        if (chips) { const c = el("span", "name", x); c.append(rm); return c; }
+        const li = el("li"), w = el("div", "who");
+        if (x === "*") w.append(el("b", "", "所有好友"), el("code", "", "*"));
+        else if (who) w.append(el("b", "", who), el("code", "", x));
+        else w.append(el("code", "only", x));
+        li.append(w, rm);
+        return li;
+      }));
+    };
+    const doAdd = () => {
+      const v = inp.value.trim();
+      if (!v) return;
+      const err = chips ? (v.length > 40 ? "名字太长" : "")
+        : /\s/.test(v) ? "wxid 里不能有空格"
+        : l.key === "group_whitelist" && !v.endsWith("@chatroom") ? "群的 id 要以 @chatroom 结尾"
+        : l.key === "whitelist" && v.endsWith("@chatroom") ? "这是群，要加到群白名单" : "";
+      if (err) { notice(err); return; }
+      if (!edit.lists[l.key].includes(v)) edit.lists[l.key].push(v);
+      inp.value = "";
+      draw();
+      renderDirty();
+    };
+    btn.onclick = doAdd;
+    inp.onkeydown = e => { if (e.key === "Enter") doAdd(); };
+    drawList[l.key] = draw;
+    draw();
+    add.append(inp, btn);
+    box.append(top, el("span", "sub", LIST_HINT[l.key] || ""), items, add);
+    return box;
+  }));
 }
 $("ab-save").onclick = async () => {
   if (!settings) { notice("设置还没读出来，等一下"); return; }
@@ -1097,37 +1829,39 @@ $("ab-save").onclick = async () => {
 };
 $("save").onclick = async () => {
   if (busy) { notice("正在发消息，等发完再保存"); return; }
-  const data = {};
-  document.querySelectorAll("#toggles [data-key], #lists [data-key]").forEach(x => {
-    const k = x.dataset.key, kind = x.dataset.kind;
-    data[k] = kind === "toggle" ? x.checked : kind === "number" ? Number(x.value)
-      : kind === "list" ? x.value.split("\n").map(v => v.trim()).filter(Boolean) : x.value;
-  });
-  if (!Object.keys(data).length) { notice("设置还没读出来，等一下"); return; }
-  if (!confirm("保存收发开关和白名单，并重启连接器？")) return;
+  const data = changes(), n = Object.keys(data).length;
+  if (!n) { notice("没有改动"); return; }
+  if (!confirm("保存这 " + n + " 处改动，并重启连接器？")) return;
   try { await post("api/settings", data); afterRestart(); } catch (e) { notice("没保存：" + e.message); }
 };
+$("reset").onclick = () => { if (settings && !settings.setup) { resetEdit(); notice("改动都撤销了"); } };
 async function find() {
   const q = $("q").value.trim(), out = $("found");
   if (!q) return;
   try {
     const list = await getJSON("api/lookup?q=" + encodeURIComponent(q));
     out.replaceChildren(...(list.length ? list.map(x => {
-      const d = el("div", "found"), b = el("button", "", x.group ? "加到群白名单" : "加到私聊白名单");
+      const li = el("li"), key = x.group ? "group_whitelist" : "whitelist", b = el("button", "btn small soft");
+      b.type = "button";
+      label(b, "plus", x.group ? "加到群白名单" : "加到私聊白名单");
       b.onclick = () => {
-        const ta = $("list-" + (x.group ? "group_whitelist" : "whitelist"));
-        if (!ta) { notice("白名单还没读出来，等一下"); return; }
-        const items = ta.value.split("\n").map(v => v.trim()).filter(Boolean);
-        if (!items.includes(x.wxid)) { items.push(x.wxid); ta.value = items.join("\n"); }
-        notice("已加进去，点「保存并重启」才生效");
+        if (!edit) { notice("白名单还没读出来，等一下"); return; }
+        names[x.wxid] = x.name;
+        if (!edit.lists[key].includes(x.wxid)) edit.lists[key].push(x.wxid);
+        drawList[key]();
+        renderDirty();
+        notice("已加进去，点底部「保存并重启」才生效");
       };
-      d.append(el("span", "", (x.group ? "群 " : "") + x.name + "  " + x.wxid), b);
-      return d;
-    }) : [el("div", "hint", "没找到")]));
-  } catch (e) { out.textContent = "查不了"; }
+      li.append(el("span", "kind", x.group ? "群" : "好友"), el("strong", "", x.name), el("code", "", x.wxid), b);
+      return li;
+    }) : [el("li", "empty", "没找到")]));
+  } catch (e) { out.replaceChildren(el("li", "empty", "查不了")); }
 }
 $("find").onclick = find;
 $("q").onkeydown = e => { if (e.key === "Enter") find(); };
+window.addEventListener("beforeunload", e => {
+  if (!leaving && Object.keys(changes()).length) { e.preventDefault(); e.returnValue = ""; }
+});
 
 // ---------- 日志 ----------
 const LV = { DEBUG: 0, INFO: 1, WARNING: 2, ERROR: 3, CRITICAL: 3 };
@@ -1139,29 +1873,46 @@ async function refreshLog() {
   } catch (e) {}
 }
 function renderLog() {
-  const min = Number($("loglevel").value), q = $("logq").value.trim().toLowerCase(), box = $("logbox"), out = [];
+  const q = $("logq").value.trim().toLowerCase(), box = $("logbox"), out = [];
   let lv = 1;
   for (const line of logLines) {
-    const m = /^\d\d-\d\d \d\d:\d\d:\d\d (DEBUG|INFO|WARNING|ERROR|CRITICAL) /.exec(line);
-    if (m) lv = LV[m[1]];  // 没有时间和级别的行（报错的调用栈）跟着上一行算
-    if (lv < min || (q && !line.toLowerCase().includes(q))) continue;
-    out.push(el("div", lv >= 3 ? "bad" : lv === 2 ? "warn" : "", line || " "));
+    const m = /^(\d\d-\d\d \d\d:\d\d:\d\d) (DEBUG|INFO|WARNING|ERROR|CRITICAL) (.*)$/.exec(line);
+    if (m) lv = LV[m[2]];  // 没有时间和级别的行（报错的调用栈）跟着上一行算
+    if (lv < logMin || (q && !line.toLowerCase().includes(q))) continue;
+    const d = el("div", "ln l" + lv + (m ? "" : " cont"));
+    if (m) d.append(el("span", "t", m[1]), el("span", "lv", m[2]), el("span", "m", m[3]));
+    else d.append(el("span", "t", ""), el("span", "lv", ""), el("span", "m", line || " "));
+    out.push(d);
   }
-  box.replaceChildren(...(out.length ? out : [el("div", "muted", "没有符合条件的行")]));
+  box.replaceChildren(...(out.length ? out : [el("div", "empty", "没有符合条件的行")]));
   $("logcount").textContent = "显示 " + out.length + " / " + logLines.length + " 行";
-  if ($("follow").checked) box.scrollTop = box.scrollHeight;
+  if (follow) box.scrollTop = box.scrollHeight;
+}
+function setFollow(on) {
+  follow = on;
+  $("follow").setAttribute("aria-checked", String(on));
+  $("tolatest").hidden = on;
+  $("logdot").classList.toggle("live", on);
+  $("loglive").textContent = on ? "跟到最新 · 每 3 秒刷新" : "已停在这里，不再滚动";
+  if (on) $("logbox").scrollTop = $("logbox").scrollHeight;
 }
 $("logbox").addEventListener("scroll", () => {
-  const b = $("logbox");
-  $("follow").checked = b.scrollTop + b.clientHeight >= b.scrollHeight - 20;  // 往上翻就先不跟，翻回底部接着跟
+  const b = $("logbox"), bottom = b.scrollTop + b.clientHeight >= b.scrollHeight - 20;
+  if (bottom !== follow) setFollow(bottom);  // 往上翻就先不跟，翻回底部接着跟
 });
-$("follow").onchange = () => { if ($("follow").checked) $("logbox").scrollTop = $("logbox").scrollHeight; };
-$("loglevel").onchange = renderLog;
+$("follow").onclick = () => setFollow(!follow);
+$("tolatest").onclick = () => setFollow(true);
+document.querySelectorAll("#loglevel button").forEach(b => b.onclick = () => {
+  logMin = Number(b.dataset.min);
+  document.querySelectorAll("#loglevel button").forEach(x => x.setAttribute("aria-pressed", String(x === b)));
+  renderLog();
+});
 $("logq").oninput = renderLog;
 $("loglines").onchange = refreshLog;
 
 applyTheme(theme());
 showNotifyButton();
+syncMenu();
 showTab();  // 先按正常模式显示；拿到状态后是首次配置的话再换
 refresh();
 setInterval(refresh, 5000);
