@@ -13,6 +13,13 @@ Linux 微信是 Qt 写的，带无障碍桥：打开 org.a11y.Status.IsEnabled �
   {"op": "send", "name": "备注名", "file": "/tmp/xx/语音.mp3", "sections": ["群聊"], "use_list": true}
   {"op": "send", "name": "备注名", "voice": "/tmp/xx/voice.wav", "sections": ["联系人"], "use_list": true}
   → {"ok": true, "path": "list|search|already"} / {"ok": false, "reason": "...", "recording": false}
+  看门狗用的三个：
+  {"op": "health"}  → {"ok": true, "frame": true, "width": 1003, "height": 608, "login": false, "search": true,
+                       "nav": true, "buttons": 58, "items": 13, "windows": 1, "idle": 42, "saver": "disabled"}
+                       （只读，不动窗口；只有有没有和个数，没有控件名字；idle 是 X 多少秒没有输入）
+  {"op": "nudge", "level": 1} → {"ok": true, "done": ["重置屏保", ...]}（唤醒：1 级鼠标在主窗口上晃一下，不点；
+                       2 级再叫出主窗口、点左边的「微信」按钮）
+  {"op": "saver_off"} → {"ok": true, "before": "off", "after": "disabled"}（关掉 X 屏保）
 
 发文件是用 text/uri-list 粘贴：GIF 会变成动画表情，PNG/JPG 变成图片，其他（比如 mp3）变成文件。
 发语音条用微信自带的「发语音」：点它开始录音 → 把音频播进虚拟麦克风 → 点「发送语音」。
@@ -497,6 +504,112 @@ def grab_login() -> dict:
     return {"ok": True, "login": True, "state": state, "text": text, "png": base64.b64encode(png).decode()}
 
 
+_XSS = None
+
+
+def x_idle() -> tuple[int, str]:
+    """X 多少秒没有输入（xdotool 的鼠标键盘操作也算）和屏保状态 on / off / disabled（MIT-SCREEN-SAVER 扩展）；
+    读不到返回 (-1, "")"""
+    global _XSS
+    import ctypes
+    import ctypes.util
+
+    class Info(ctypes.Structure):
+        _fields_ = [("window", ctypes.c_ulong), ("state", ctypes.c_int), ("kind", ctypes.c_int),
+                    ("til_or_since", ctypes.c_ulong), ("idle", ctypes.c_ulong), ("event_mask", ctypes.c_ulong)]
+
+    try:
+        if _XSS is None:
+            x11 = ctypes.CDLL(ctypes.util.find_library("X11") or "libX11.so.6")
+            xss = ctypes.CDLL(ctypes.util.find_library("Xss") or "libXss.so.1")
+            x11.XOpenDisplay.argtypes, x11.XOpenDisplay.restype = [ctypes.c_char_p], ctypes.c_void_p
+            x11.XDefaultRootWindow.argtypes, x11.XDefaultRootWindow.restype = [ctypes.c_void_p], ctypes.c_ulong
+            x11.XCloseDisplay.argtypes = [ctypes.c_void_p]
+            x11.XFree.argtypes = [ctypes.c_void_p]
+            xss.XScreenSaverQueryInfo.argtypes = [ctypes.c_void_p, ctypes.c_ulong, ctypes.c_void_p]
+            _XSS = (x11, xss)
+        x11, xss = _XSS
+        display = x11.XOpenDisplay(None)
+        if not display:
+            return -1, ""
+        try:
+            info = Info()
+            if not xss.XScreenSaverQueryInfo(display, x11.XDefaultRootWindow(display), ctypes.byref(info)):
+                return -1, ""
+            return int(info.idle // 1000), {0: "off", 1: "on", 3: "disabled"}.get(info.state, str(info.state))
+        finally:
+            x11.XCloseDisplay(display)
+    except (OSError, AttributeError):
+        return -1, ""
+
+
+def health() -> dict:
+    """看门狗用，只读、不动窗口：主窗口多大、是不是登录窗口、找不找得到搜索框和左边的「微信」按钮、
+    有几个按钮和列表项、开着几个微信窗口，X 多久没有输入、屏保开没开。不给任何控件的名字"""
+    idle, saver = x_idle()
+    app, frame = wechat_app(), main_frame()
+    w, h = ext(frame)[2:] if frame is not None else (0, 0)
+    windows = 0
+    for i in range(app.get_child_count() if app else 0):
+        try:
+            tw, th = ext(app.get_child_at_index(i))[2:]
+        except Exception:
+            continue
+        windows += tw > 0 and th > 0
+    out = {"ok": True, "frame": frame is not None, "width": w, "height": h, "login": False, "windows": windows,
+           "idle": idle, "saver": saver}
+    if 0 < w <= 600:  # 小得像登录窗口：认一下
+        out["login"] = login_info()["login"]
+    elif w > 600:
+        search = nav = False
+        buttons = items = 0
+        for node in walk(frame):
+            kind = role(node)
+            if kind == "push button":
+                buttons += 1
+                try:
+                    nav = nav or node.get_name() == "微信"
+                except Exception:
+                    pass
+            elif kind == "list item":
+                items += 1
+            elif kind == "text" and not search:  # 和 search_box() 同一个判断
+                _x, _y, tw, th = ext(node)
+                search = th < 40 and tw < 300
+        out.update(search=search, nav=nav, buttons=buttons, items=items)
+    return out
+
+
+def nudge(level: int) -> dict:
+    """看门狗用：像有人回到电脑前那样动一下。1 级：重置屏保，鼠标在微信主窗口上晃一下再放回原处（不点）；
+    2 级：再把主窗口叫出来（收在托盘里就点托盘图标）、激活，点一下左边的「微信」按钮（发消息前本来也会点）"""
+    done = []
+    sh("xset", "s", "reset")
+    done.append("重置屏保")
+    where = dict(l.split("=", 1) for l in sh("xdotool", "getmouselocation", "--shell").splitlines() if "=" in l)
+    wid = big_window()
+    if wid:
+        geo = dict(l.split("=", 1) for l in sh("xdotool", "getwindowgeometry", "--shell", wid).splitlines())
+        cx, cy = int(geo["X"]) + int(geo["WIDTH"]) // 2, int(geo["Y"]) + int(geo["HEIGHT"]) // 2
+    else:
+        screen = (sh("xdotool", "getdisplaygeometry").split() + ["1024", "768"])[:2]
+        cx, cy = int(screen[0]) // 2, int(screen[1]) // 2
+    for dx, dy in ((0, 0), (8, 6), (-8, -6), (0, 0)):
+        sh("xdotool", "mousemove", str(cx + dx), str(cy + dy))
+        time.sleep(0.15)
+    if "X" in where and "Y" in where:
+        sh("xdotool", "mousemove", where["X"], where["Y"])
+    done.append("鼠标在主窗口上晃了一下" if wid else "鼠标在屏幕中间晃了一下（主窗口没显示）")
+    if level >= 2:
+        shown = show_main_window()
+        done.append("叫出了主窗口" if shown else "主窗口叫不出来")
+        btn = nav_button("微信") if shown else None
+        if btn is not None:
+            click(btn)
+            done.append("点了「微信」按钮")
+    return {"ok": True, "done": done}
+
+
 def main() -> None:
     if not enable_a11y():
         log("打开无障碍开关失败（会话总线地址不对？）")
@@ -518,6 +631,14 @@ def main() -> None:
                     resp.update(login=info["login"], login_text=info.get("text", ""))
             elif op == "login":  # 状态页的登录页用：只读；grab 时截登录窗口
                 resp = grab_login() if req.get("grab") else login_info()
+            elif op == "health":
+                resp = health()
+            elif op == "nudge":
+                resp = nudge(int(req.get("level") or 1))
+            elif op == "saver_off":
+                before = x_idle()[1]
+                sh("xset", "s", "off")
+                resp = {"ok": True, "before": before, "after": x_idle()[1]}
             elif op == "send":
                 resp = handle_send(req)
             else:

@@ -10,7 +10,7 @@ nginx 把网页桌面（3001 端口，有密码）的 /wxc/ 转过来，所以�
 AstrBot 的口令只写不读：哪个接口都不返回它，页面上只显示设没设置。
 
   GET  /               页面（每 5 秒刷新一次状态）
-  GET  /api/status     状态 JSON，也可以给脚本拿来做掉线提醒
+  GET  /api/status     状态 JSON，也可以给脚本拿来做掉线提醒（stall 是看门狗的判断：卡没卡、卡了多久、唤醒了几次）
   GET  /api/log?lines= connector.log 最后几行（默认 200，最多 2000）
   GET  /api/settings   能在页面上改的设置（口令只给设没设置）
   GET  /api/lookup?q=  按名字查好友和群（填白名单用）
@@ -110,6 +110,25 @@ class WindowProbe:
         return self.result
 
 
+def stall_check(s: dict) -> tuple[str, str]:
+    """看门狗那一项：卡住标红、疑似标黄，正常时写最后一次入站和上一次卡住"""
+    state = s.get("state")
+    if state == "disabled":
+        return "ok", "没开（watchdog）"
+    if state in ("stuck", "suspect"):
+        return ("bad" if state == "stuck" else "warn",
+                f"{'卡住' if state == 'stuck' else '疑似卡住'} {s['for']}（{s['since_text']} 起）：{'；'.join(s['reasons'])}；"
+                f"{'已自动唤醒 ' + str(s['nudges']) + ' 次' if s['nudges'] else '马上自动唤醒'}")
+    if state == "login":
+        return "ok", "停在登录窗口，先不查（看「微信窗口」那项）"
+    if state == "off":
+        return "ok", "微信没在运行，先不查"
+    last = f"最后一次入站在 {s['last_inbound_ago']}前" if s.get("last_inbound") else "启动后还没有入站"
+    rec = s.get("recovered")
+    tail = f"；上一次 {rec['start_text']} 起卡了 {rec['for']}（期间自动唤醒 {rec['nudges']} 次）" if rec else ""
+    return "ok", f"没发现卡住，{last}{tail}"
+
+
 def window_check(w: dict) -> tuple[str, str]:
     if "ok" not in w:  # 还没查过（刚启动就赶上发消息时，只有一句 note）
         return "warn", "还没查过"
@@ -192,6 +211,8 @@ async def status(c, probe: WindowProbe) -> dict:
         checks.append(("微信进程", "bad", "没在运行"))
     window = await probe.get(c)
     checks.append(("微信窗口", *window_check(window)))
+    stall = c.watchdog.snapshot(now)
+    checks.append(("卡住检测", *stall_check(stall)))
 
     dbs = list(c.store.msg_dbs.values())
     readable = sum(1 for d in dbs if d.con is not None)
@@ -254,6 +275,7 @@ async def status(c, probe: WindowProbe) -> dict:
                  "last_minute": sum(1 for t in c.sent_times if now - t <= 60),
                  "per_minute": c.cfg["max_sends_per_minute"]},
         "checks": [{"name": n, "level": lv, "text": t} for n, lv, t in checks],
+        "stall": stall,
         "counts": dict(sorted(c.counts.items())),
         "recent_sends": [{**s, "ago": ago(now - s["time"])} for s in reversed(sends[-12:])],
         "config": {
@@ -835,6 +857,7 @@ h3.group { margin: 14px 0 2px; font-size: 12px; font-weight: 600; color: var(--m
 .banner > div { min-width: 0; }
 .banner strong { display: block; font-size: 14px; }
 .banner #loginsub { display: block; font-size: 12.5px; color: var(--text-2); }
+.banner .more { display: block; font-size: 12.5px; color: var(--text-2); overflow-wrap: anywhere; }
 .qrstage { display: flex; justify-content: center; padding: 4px 0; }
 .qrframe { width: 300px; max-width: 100%; padding: 10px; border-radius: 18px; background: #fff; border: 1px solid rgba(15, 23, 42, .06);
   box-shadow: 0 1px 2px rgba(0, 0, 0, .06), 0 18px 40px -18px rgba(15, 23, 42, .4); }
@@ -1094,6 +1117,9 @@ select { min-height: 44px; padding: 0 12px; border: 0; border-radius: 12px; font
   <div class="wrap">
 
   <section id="tab-overview" class="tab">
+    <div class="banner bad" id="stall" hidden><span id="stallicon"></span><div><strong id="stalltitle"></strong>
+      <span class="more" id="stallsub"></span><span class="more" id="stallmeta"></span>
+      <span class="more">一直不好的话：打开网页桌面，在微信窗口上动一下鼠标，一两分钟后多半就恢复了</span></div></div>
     <div class="ov-top">
       <div class="ov-left">
         <section class="card account" aria-label="小号">
@@ -1573,6 +1599,17 @@ function renderOverview(s) {
   renderChecks($("checks"), s.checks, true);
   renderCounts(counts);
   renderSends(s.recent_sends);
+
+  const st = s.stall || {}, stalled = st.state === "stuck" || st.state === "suspect";
+  $("stall").hidden = !stalled;
+  if (stalled) {
+    $("stall").className = "banner " + (st.state === "stuck" ? "bad" : "warn");
+    $("stallicon").replaceChildren(icon("alert"));
+    $("stalltitle").textContent = (st.state === "stuck" ? "微信卡住了 " : "微信可能卡住了 ") + st.for + "（" + st.since_text + " 起）";
+    $("stallsub").textContent = st.reasons.join("；");
+    $("stallmeta").textContent = ["最后一次入站：" + (st.last_inbound ? st.last_inbound_text + "（" + st.last_inbound_ago + "前）" : "启动后还没有"),
+      st.nudges ? "已自动唤醒 " + st.nudges + " 次，上次在 " + st.last_nudge_ago + "前" : "马上自动唤醒"].join(" · ");
+  }
 
   const db = s.checks.find(c => c.name === "数据库");
   if (db) { $("dbstate").className = "state " + db.level; $("dbstate").textContent = db.text; }

@@ -19,6 +19,7 @@
     界面没动过、一个字没发出去的失败（核对没过、没找到搜索框）等 2 秒重试一次
 状态页：容器里 127.0.0.1:6299 上的网页（webui.py），nginx 把网页桌面的 /wxc/ 转过来：
     看状态、扫码登录、暂停发送、发测试消息、改常用设置和 AstrBot 地址口令、看日志
+看门狗（watchdog.py）：微信卡住（收不到消息、发消息找不到搜索框）时自动唤醒，状态页标红
 首次配置：还没有 config.json 或 keys.json 时只开状态页（扫码登录、抓密钥的命令、填 AstrBot 地址和口令），
     两份都有了就退出，s6 重新拉起来时就是正常模式
 
@@ -48,11 +49,12 @@ from collections import Counter, OrderedDict, deque
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 import media  # noqa: E402
 import onebot  # noqa: E402
+import watchdog  # noqa: E402
 import webui  # noqa: E402
 import wxdb  # noqa: E402
 import wximg  # noqa: E402
 
-VERSION = "0.16.1"
+VERSION = "0.17.0"
 HERE = os.path.dirname(os.path.abspath(__file__))
 # 界面驱动的这些失败都发生在回车之前（回车前核对失败时已经清空输入框），一个字都没发出去，可以重试
 # 发图片后回查数据库确认用：PNG/JPG 存成图片 3，GIF 粘贴后存成动画表情附件 (49, 8)，有时是表情 47
@@ -111,6 +113,8 @@ DEFAULTS = {
     "max_queue_wait": 150,  # 排队超过这么多秒还没轮到就不发了（AstrBot 等回执最多 180 秒，超时后插件可能已经改发文字）
     "webui_host": "127.0.0.1",  # 只读状态页，容器里的 nginx 把 /wxc/ 转过来（沿用网页桌面的密码）
     "webui_port": 6299,         # 0 = 不开
+    "watchdog": True,           # 看门狗：微信卡住时自动唤醒、状态页标红（见 watchdog.py）
+    "watchdog_screensaver_off": True,  # 看门狗启动时关掉 X 屏保
 }
 
 
@@ -316,6 +320,7 @@ class Connector:
         self.groups = {g for g in cfg["group_whitelist"] if g.endswith("@chatroom")}
         self.self_id = onebot.stable_id(self.store.self_wxid)
         self.ui = UiDriver(cfg["ui_python"], wechat_env())
+        self.watchdog = watchdog.Watchdog(self)
         self.db_lock = asyncio.Lock()
         self.send_queue: asyncio.Queue = asyncio.Queue()
         self.sending = False  # 发送队列正在发一条
@@ -392,6 +397,8 @@ class Connector:
                 async with self.db_lock:
                     msgs = await asyncio.to_thread(self.store.new_messages, wxid, marks)
                 changed |= marks != before
+                if msgs:
+                    self.watchdog.on_inbound()
                 for m in msgs:
                     try:
                         await self.deliver(wxid, m)
@@ -944,6 +951,7 @@ class Connector:
         self.recent_sends.append({"time": time.time(), "to": label, "what": what, "ok": bool(resp.get("ok")),
                                   "reason": "" if resp.get("ok") else str(resp.get("reason", ""))[:80]})
         self.counts["发出" if resp.get("ok") else "发送失败"] += 1
+        self.watchdog.on_send(bool(resp.get("ok")), str(resp.get("reason", "")))
         if not resp.get("ok"):
             log.warning("发给 %s 失败（%s）：%s", label, what, resp.get("reason"))
             return False, f"发送失败：{resp.get('reason')}"
@@ -977,6 +985,8 @@ class Connector:
             tasks.append(asyncio.create_task(webui.serve(self, self.cfg["webui_host"], int(self.cfg["webui_port"]))))
         if self.cfg["receive_photos"] and self.cfg["photo_port"]:
             tasks.append(asyncio.create_task(self.serve_photos(int(self.cfg["photo_port"]))))
+        if self.watchdog.enabled:
+            tasks.append(asyncio.create_task(self.watchdog.run()))
         if not self.cfg["receive_only"]:
             tasks.append(asyncio.create_task(self.send_worker()))
             tasks.append(asyncio.create_task(self.ob.run_forever()))
