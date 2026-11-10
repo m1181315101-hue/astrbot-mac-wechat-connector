@@ -19,6 +19,10 @@ ENV PULSE_SERVER=unix:/defaults/native \
 RUN sed -i 's|^  location SUBFOLDER {$|  location = SUBFOLDERwxc { return 301 SUBFOLDERwxc/; }\n  location SUBFOLDERwxc/ {\n    proxy_pass http://127.0.0.1:6299/;\n  }\n&|' /defaults/default.conf \
  && test "$(grep -c 'proxy_pass http://127.0.0.1:6299/' /defaults/default.conf)" = 2
 
+# 网页桌面里加一个「← 状态页」小按钮（docker/root/etc/nginx/wxc-back.conf）：在网页桌面那个 location 里 include 进来
+RUN sed -i 's|^  location SUBFOLDER {$|&\n    include /etc/nginx/wxc-back.conf;|' /defaults/default.conf \
+ && test "$(grep -c 'include /etc/nginx/wxc-back.conf;' /defaults/default.conf)" = 2
+
 COPY connector/ /opt/wechat-connector/
 # init-wxvmic：PulseAudio 之后、桌面之前建虚拟麦克风；svc-wechat-connector：微信起来后启动连接器
 COPY docker/root/ /
