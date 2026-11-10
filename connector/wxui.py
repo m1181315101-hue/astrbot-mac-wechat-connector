@@ -16,7 +16,10 @@ Linux 微信是 Qt 写的，带无障碍桥：打开 org.a11y.Status.IsEnabled �
   看门狗用的三个：
   {"op": "health"}  → {"ok": true, "frame": true, "width": 1003, "height": 608, "login": false, "search": true,
                        "nav": true, "buttons": 58, "items": 13, "windows": 1, "idle": 42, "saver": "disabled"}
-                       （只读，不动窗口；只有有没有和个数，没有控件名字；idle 是 X 多少秒没有输入）
+                       （只读，不动窗口；只有有没有和个数，没有控件名字；idle 是 X 多少秒没有输入；
+                       "app": false 是无障碍树里没有微信：微信是在无障碍总线坏着的时候启动的，要重启微信）
+  无障碍总线不可用时（问会话总线要不到它的地址），要读界面的操作一律回
+  {"ok": false, "a11y": false, "reason": "无障碍总线不可用"}，不去碰无障碍树。
   {"op": "nudge", "level": 1} → {"ok": true, "done": ["重置屏保", ...]}（唤醒：1 级鼠标在主窗口上晃一下，不点；
                        2 级再叫出主窗口、点左边的「微信」按钮）
   {"op": "saver_off"} → {"ok": true, "before": "off", "after": "disabled"}（关掉 X 屏保）
@@ -111,6 +114,30 @@ def enable_a11y() -> bool:
                           "--method", "org.freedesktop.DBus.Properties.Set", "org.a11y.Status", "IsEnabled",
                           "<true>"], capture_output=True, check=False)
     return out.returncode == 0
+
+
+A11Y_DOWN = "无障碍总线不可用"
+_A11Y = False  # 问到过一次地址就不再问
+
+
+def a11y_ok() -> bool:
+    """无障碍总线在不在：问会话总线上的 org.a11y.Bus 要地址，和 libatspi 自己问的是同一处。
+    要不到时 libatspi 不报错，直接让进程退出（dbind-ERROR），连接器那边只看到「界面驱动无响应」，
+    所以碰无障碍树之前先问一下。见过一次：容器重启后这条总线没起来，一整天发不出消息"""
+    global _A11Y
+    if _A11Y:
+        return True
+    try:
+        out = subprocess.run(["gdbus", "call", "--session", "--timeout", "5", "--dest", "org.a11y.Bus",
+                              "--object-path", "/org/a11y/bus", "--method", "org.a11y.Bus.GetAddress"],
+                             capture_output=True, text=True, timeout=8, check=False)
+    except (OSError, subprocess.TimeoutExpired):
+        return False
+    found = re.match(r"\('(.+)',\)\s*$", out.stdout) if out.returncode == 0 else None
+    if found:
+        _A11Y = True
+        enable_a11y()  # 启动时总线还没起来的话，那次没打开
+    return _A11Y
 
 
 def wechat_app():
@@ -556,8 +583,8 @@ def health() -> dict:
         except Exception:
             continue
         windows += tw > 0 and th > 0
-    out = {"ok": True, "frame": frame is not None, "width": w, "height": h, "login": False, "windows": windows,
-           "idle": idle, "saver": saver}
+    out = {"ok": True, "app": app is not None, "frame": frame is not None, "width": w, "height": h, "login": False,
+           "windows": windows, "idle": idle, "saver": saver}
     if 0 < w <= 600:  # 小得像登录窗口：认一下
         out["login"] = login_info()["login"]
     elif w > 600:
@@ -600,7 +627,9 @@ def nudge(level: int) -> dict:
     if "X" in where and "Y" in where:
         sh("xdotool", "mousemove", where["X"], where["Y"])
     done.append("鼠标在主窗口上晃了一下" if wid else "鼠标在屏幕中间晃了一下（主窗口没显示）")
-    if level >= 2:
+    if level >= 2 and not a11y_ok():
+        done.append(f"{A11Y_DOWN}，没去叫主窗口")
+    elif level >= 2:
         shown = show_main_window()
         done.append("叫出了主窗口" if shown else "主窗口叫不出来")
         btn = nav_button("微信") if shown else None
@@ -620,7 +649,9 @@ def main() -> None:
         try:
             req = json.loads(line)
             op = req.get("op")
-            if op == "ping":
+            if op in ("ping", "status", "login", "health", "send") and not a11y_ok():
+                resp = {"ok": False, "a11y": False, "reason": A11Y_DOWN}
+            elif op == "ping":
                 resp = {"ok": show_main_window() and main_frame() is not None}
             elif op == "status":  # 状态页用：只看不动（ping 会把窗口从托盘里拉出来、调大小）
                 frame = main_frame()

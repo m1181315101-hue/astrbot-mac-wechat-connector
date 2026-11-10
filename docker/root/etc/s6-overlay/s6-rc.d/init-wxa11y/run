@@ -1,0 +1,13 @@
+#!/usr/bin/with-contenv bash
+# 桌面（微信）起来之前，清掉无障碍总线上次留下的文件。
+# 连接器靠无障碍总线读微信的界面。这条总线的套接字放在 XDG_RUNTIME_DIR 里，按规矩这个目录每次开机都该是空的，
+# 可镜像把它放在 /config/.XDG —— /config 是从外面挂进来的，容器重启后上次的 at-spi/bus_1 还在。
+# 见过一次：容器重启后这条总线没起来（问它要地址，回的是空的），微信一整天发不出消息；
+# 把旧的 bus_1 清掉以后它才起得来。是不是每次都因为它还没证实，清掉总归没有坏处。
+# 只删 at-spi 开头的那几个，别的（dconf、dbus-1）不动；这个脚本无论如何都算成功，不能挡住桌面启动。
+for d in "${XDG_RUNTIME_DIR:-}" /config/.XDG; do
+  case "$d" in
+    /config/*) rm -rf "$d"/at-spi "$d"/at-spi2-* 2>/dev/null ;;
+  esac
+done
+exit 0

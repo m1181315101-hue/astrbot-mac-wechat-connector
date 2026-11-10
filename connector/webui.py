@@ -118,7 +118,8 @@ def stall_check(s: dict) -> tuple[str, str]:
     if state in ("stuck", "suspect"):
         return ("bad" if state == "stuck" else "warn",
                 f"{'卡住' if state == 'stuck' else '疑似卡住'} {s['for']}（{s['since_text']} 起）：{'；'.join(s['reasons'])}；"
-                f"{'已自动唤醒 ' + str(s['nudges']) + ' 次' if s['nudges'] else '马上自动唤醒'}")
+                + (f"{'已自动唤醒 ' + str(s['nudges']) + ' 次' if s['nudges'] else '马上自动唤醒'}"
+                   if s.get("nudging", True) else "这种情况唤醒没用，要重启容器（docker restart wechat）"))
     if state == "login":
         return "ok", "停在登录窗口，先不查（看「微信窗口」那项）"
     if state == "off":
@@ -1119,7 +1120,7 @@ select { min-height: 44px; padding: 0 12px; border: 0; border-radius: 12px; font
   <section id="tab-overview" class="tab">
     <div class="banner bad" id="stall" hidden><span id="stallicon"></span><div><strong id="stalltitle"></strong>
       <span class="more" id="stallsub"></span><span class="more" id="stallmeta"></span>
-      <span class="more">一直不好的话：打开网页桌面，在微信窗口上动一下鼠标，一两分钟后多半就恢复了</span></div></div>
+      <span class="more" id="stalladvice"></span></div></div>
     <div class="ov-top">
       <div class="ov-left">
         <section class="card account" aria-label="小号">
@@ -1605,10 +1606,12 @@ function renderOverview(s) {
   if (stalled) {
     $("stall").className = "banner " + (st.state === "stuck" ? "bad" : "warn");
     $("stallicon").replaceChildren(icon("alert"));
-    $("stalltitle").textContent = (st.state === "stuck" ? "微信卡住了 " : "微信可能卡住了 ") + st.for + "（" + st.since_text + " 起）";
+    $("stalltitle").textContent = (st.nudging === false ? "读不到微信的界面，发不出消息 " : st.state === "stuck" ? "微信卡住了 " : "微信可能卡住了 ")
+      + st.for + "（" + st.since_text + " 起）";
     $("stallsub").textContent = st.reasons.join("；");
     $("stallmeta").textContent = ["最后一次入站：" + (st.last_inbound ? st.last_inbound_text + "（" + st.last_inbound_ago + "前）" : "启动后还没有"),
-      st.nudges ? "已自动唤醒 " + st.nudges + " 次，上次在 " + st.last_nudge_ago + "前" : "马上自动唤醒"].join(" · ");
+      st.nudging === false ? "没有自动唤醒" : st.nudges ? "已自动唤醒 " + st.nudges + " 次，上次在 " + st.last_nudge_ago + "前" : "马上自动唤醒"].join(" · ");
+    $("stalladvice").textContent = st.advice || "";
   }
 
   const db = s.checks.find(c => c.name === "数据库");

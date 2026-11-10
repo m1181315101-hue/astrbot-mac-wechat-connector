@@ -54,7 +54,7 @@ import webui  # noqa: E402
 import wxdb  # noqa: E402
 import wximg  # noqa: E402
 
-VERSION = "0.17.0"
+VERSION = "0.17.1"
 HERE = os.path.dirname(os.path.abspath(__file__))
 # 界面驱动的这些失败都发生在回车之前（回车前核对失败时已经清空输入框），一个字都没发出去，可以重试
 # 发图片后回查数据库确认用：PNG/JPG 存成图片 3，GIF 粘贴后存成动画表情附件 (49, 8)，有时是表情 47
@@ -979,7 +979,8 @@ class Connector:
                  "只收不发" if self.cfg["receive_only"] else f"连 {self.cfg['astrbot_ws_url']}")
         await self.init_marks()
         ping = await asyncio.to_thread(self.ui.request, {"op": "ping"}, 20.0)
-        log.info("界面驱动：%s", "就绪" if ping.get("ok") else "没找到微信主窗口（检查无障碍组件）")
+        log.info("界面驱动：%s", "就绪" if ping.get("ok") else "无障碍总线不可用（发不出消息，见 README「已知限制」）"
+                 if ping.get("a11y") is False else "没找到微信主窗口（检查无障碍组件）")
         tasks = [asyncio.create_task(self.poll_loop())]
         if self.cfg["webui_port"]:
             tasks.append(asyncio.create_task(webui.serve(self, self.cfg["webui_host"], int(self.cfg["webui_port"]))))

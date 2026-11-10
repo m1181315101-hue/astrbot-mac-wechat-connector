@@ -24,5 +24,6 @@ RUN sed -i 's|^  location SUBFOLDER {$|&\n    include /etc/nginx/wxc-back.conf;|
  && test "$(grep -c 'include /etc/nginx/wxc-back.conf;' /defaults/default.conf)" = 2
 
 COPY connector/ /opt/wechat-connector/
-# init-wxvmic：PulseAudio 之后、桌面之前建虚拟麦克风；svc-wechat-connector：微信起来后启动连接器
+# init-wxvmic：PulseAudio 之后、桌面之前建虚拟麦克风；init-wxa11y：桌面之前清掉无障碍总线上次留下的文件；
+# svc-wechat-connector：微信起来后启动连接器
 COPY docker/root/ /

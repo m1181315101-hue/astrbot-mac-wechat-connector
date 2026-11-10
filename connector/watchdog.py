@@ -1,17 +1,16 @@
-"""看门狗：微信「没人操作就停摆」的检测、自动唤醒和状态页告警
+"""看门狗：微信界面不对时的检测、自动唤醒和状态页告警
 
-见过的样子：凌晨 4 点前后 WeChatAppEx（微信内置的浏览器内核）整组重启，之后它里面的 ILink 服务
-（命令行带 --utility-sub-type=flue.mojom.ILinkServiceHost）没再起来，微信收不到新消息、发消息时找不到搜索框；
-直到有人打开网页桌面动了鼠标，一两分钟后 ILink 服务和微信的几个辅助进程重新起来，积压的消息一下子进来。
-光是没人看网页桌面不会卡：恢复以后十几个小时没人看，一直正常。
-手动结束 WeChatAppEx 主进程也不会卡：微信一秒内把它拉起来，ILink 服务跟着起来，辅助进程不动（11-02 试过），
-所以凌晨那次走的是别的路；看门狗把辅助进程也记下来，下次出事时看它们是不是一起没了。
-
-判定（每 30 秒看一次进程；界面正常时每 3 分钟看一次，有问题时每分钟一次，正在发消息就下一轮再看）：
-- 卡住（标红）：连续 3 次发送因为界面失败（没找到搜索框 / 找不到微信主窗口 / 界面驱动无响应），
+管三种情况（每 30 秒看一次进程；界面正常时每 3 分钟看一次，有问题时每分钟一次，正在发消息就下一轮再看）：
+- 卡住（标红），会自动唤醒：连续 3 次发送因为界面失败（没找到搜索框 / 找不到微信主窗口 / 界面驱动无响应），
   或者连续两次看到主窗口开着、却找不到搜索框；
-- 疑似卡住（标黄）：这次启动后见过 ILink 服务，它没了超过 5 分钟。
+- 疑似卡住（标黄），会自动唤醒：这次启动后见过 ILink 服务（WeChatAppEx 里命令行带
+  --utility-sub-type=flue.mojom.ILinkServiceHost 的进程），它没了超过 5 分钟；
+- 无障碍总线不可用，或者微信没接上无障碍总线（标红），不唤醒：连接器是靠无障碍总线读微信界面的，
+  这条总线没起来、或者微信是在它坏着的时候启动的，鼠标怎么晃都没用，直接在状态页写清楚要重启容器。
+  11-10 见过一次：容器重启后总线没起来，一整天发不出消息，当时的看门狗白白唤醒了 25 次。
 停在登录窗口、微信没在运行都不算卡住（概览里别的检查项会标出来），也不唤醒。
+凌晨见过多次的「收不到消息」其实是微信掉线退回了登录窗口（辅助进程和 ILink 服务同一刻没了），属于这一类，
+要有人重新登录；看门狗把那一刻记进日志。手动结束 WeChatAppEx 主进程不会卡：微信一秒内把它拉起来（11-02 试过）。
 自愈：卡住或疑似时马上唤醒一次，没好就 2、5、15、30 分钟后再试，之后每 30 分钟一次，1 级、2 级交替：
 1 级重置屏保、鼠标在微信主窗口上晃一下再放回去（不点）；2 级再叫出主窗口、点一下左边的「微信」按钮。
 启动时关掉 X 屏保（watchdog_screensaver_off）。
@@ -31,8 +30,10 @@ ILINK_GRACE = 300       # ILink 服务没了这么久才算疑似卡住
 SEND_FAILS = 3          # 连续这么多次发送因为界面失败就算卡住
 UI_BAD = 2              # 连续这么多次看到主窗口开着却找不到搜索框就算卡住
 NUDGE_GAPS = (120, 180, 600, 900, 1800)  # 唤醒：马上一次，之后隔 2、3、10、15 分钟（即 2、5、15、30 分钟时），再往后每 30 分钟
-UI_REASONS = ("没找到搜索框", "找不到微信主窗口", "界面驱动无响应")  # 这些发送失败说明界面不对（不是名字对不上那类）
+A11Y_DOWN = "无障碍总线不可用"  # 界面驱动问不到无障碍总线的地址时回这个（wxui.py 里同名）
+UI_REASONS = ("没找到搜索框", "找不到微信主窗口", "界面驱动无响应", A11Y_DOWN)  # 这些发送失败说明界面不对（不是名字对不上那类）
 STALLED = ("suspect", "stuck")
+NO_NUDGE = {"a11y", "noapp"}  # 这两种原因唤醒没用：要重启容器（或者修好总线后重启微信）
 HELPERS = ("wxocr", "wxutility", "wxplayer")  # 微信主进程带起来的辅助进程；11-01 凌晨卡住后和 ILink 服务同一秒起来
 
 
@@ -100,6 +101,10 @@ class Watchdog:
         self.ui_at = 0.0
         self.ui_bad = 0            # 连续几次看到主窗口开着却找不到搜索框
         self.ui_bad_since = 0.0
+        self.a11y_bad = 0          # 连续几次界面驱动说无障碍总线不可用
+        self.a11y_since = 0.0
+        self.noapp_bad = 0         # 连续几次无障碍树里没有微信（微信明明在运行）
+        self.noapp_since = 0.0
         self.fails = 0             # 连续几次发送因为界面失败
         self.fail_since = 0.0
         self.fail_reason = ""
@@ -151,10 +156,11 @@ class Watchdog:
 
     async def tick(self) -> None:
         self.note_proc(await asyncio.to_thread(radium_state), time.time())
-        if time.time() - self.ui_at >= (UI_EVERY_STALLED if self.state in STALLED else UI_EVERY):
+        soon = self.state in STALLED or self.a11y_bad or self.noapp_bad or self.fail_reason == A11Y_DOWN
+        if time.time() - self.ui_at >= (UI_EVERY_STALLED if soon else UI_EVERY):
             await self.look()
         self.judge(time.time())
-        if self.state in STALLED and time.time() >= self.next_nudge:
+        if self.state in STALLED and not NO_NUDGE & set(self.keys) and time.time() >= self.next_nudge:
             await self.nudge()
 
     def note_proc(self, proc: dict, now: float) -> None:
@@ -198,8 +204,21 @@ class Watchdog:
         now = self.ui_at = time.time()
         if not resp.get("ok"):
             self.ui = {"ok": False, "reason": str(resp.get("reason", ""))[:60]}
+            if resp.get("a11y") is False:  # 界面驱动问过了：无障碍总线不可用
+                if not self.a11y_bad:
+                    self.a11y_since = now
+                self.a11y_bad += 1
             return
+        self.a11y_bad, self.a11y_since = 0, 0.0
+        if self.fail_reason == A11Y_DOWN:  # 总线回来了：之前因为它没发出去的不再算数
+            self.fails, self.fail_since, self.fail_reason = 0, 0.0, ""
         self.ui = resp
+        if resp.get("app") is False and self.proc.get("main"):  # 总线在，但无障碍树里没有微信
+            if not self.noapp_bad:
+                self.noapp_since = now
+            self.noapp_bad += 1
+            return
+        self.noapp_bad, self.noapp_since = 0, 0.0
         if self.diag_note:
             log.info("看门狗：%s的现场：%s", self.diag_note, self.diag())
             self.diag_note = ""
@@ -220,10 +239,13 @@ class Watchdog:
         elif self.ui.get("login"):
             state, keys = "login", []
         else:
-            keys = [k for k, hit in (("fails", self.fails >= SEND_FAILS), ("ui", self.ui_bad >= UI_BAD),
-                                     ("ilink", self.ilink_seen and bool(self.ilink_gone)
-                                      and now - self.ilink_gone >= ILINK_GRACE)) if hit]
-            state = "stuck" if {"fails", "ui"} & set(keys) else "suspect" if keys else "ok"
+            hits = (("a11y", self.a11y_bad >= UI_BAD or (self.a11y_bad and self.fail_reason == A11Y_DOWN)),
+                    # 紧接着总线故障的「没接上」，看到一次就算，免得中间漏出一段去唤醒
+                    ("noapp", self.noapp_bad >= UI_BAD or (self.noapp_bad and NO_NUDGE & set(self.keys))),
+                    ("fails", self.fails >= SEND_FAILS), ("ui", self.ui_bad >= UI_BAD),
+                    ("ilink", self.ilink_seen and bool(self.ilink_gone) and now - self.ilink_gone >= ILINK_GRACE))
+            keys = [k for k, hit in hits if hit]
+            state = "stuck" if {"fails", "ui"} & set(keys) or NO_NUDGE & set(keys) else "suspect" if keys else "ok"
         if state not in STALLED:
             if self.state in STALLED and state == "ok":
                 self.recovered = {"start": self.since, "end": now, "nudges": self.nudges}
@@ -234,6 +256,7 @@ class Watchdog:
             self.state, self.keys, self.since, self.nudges, self.next_nudge = state, [], 0.0, 0, 0.0
             return
         start = min(t for t in ((self.fail_since if "fails" in keys else 0), (self.ui_bad_since if "ui" in keys else 0),
+                                (self.a11y_since if "a11y" in keys else 0), (self.noapp_since if "noapp" in keys else 0),
                                 (self.ilink_gone if "ilink" in keys else 0), now) if t)
         if self.state not in STALLED:
             self.since, self.next_nudge = start, now
@@ -243,6 +266,8 @@ class Watchdog:
         elif state != self.state or keys != self.keys:
             word = ("卡住了" if state == "stuck" else "疑似卡住") if state != self.state else "还卡着" if state == "stuck" else "还疑似卡住"
             log.warning("看门狗：%s：%s", word, "；".join(self.reasons(now, keys)))
+        if NO_NUDGE & set(keys) and not NO_NUDGE & set(self.keys if self.state in STALLED else []):
+            log.warning("看门狗：%s", self.advice(keys))
         self.since = min(self.since, start)
         self.state, self.keys = state, keys
 
@@ -265,6 +290,10 @@ class Watchdog:
     def reasons(self, now: float, keys: list[str] | None = None) -> list[str]:
         keys = self.keys if keys is None else keys
         out = []
+        if "a11y" in keys:
+            out.append(f"{A11Y_DOWN}，连接器读不到微信的界面（连续 {self.a11y_bad} 次）")
+        if "noapp" in keys:
+            out.append(f"微信在运行，但没接上无障碍总线（连续 {self.noapp_bad} 次）")
         if "fails" in keys:
             out.append(f"连续 {self.fails} 次发送因为界面没发出去（{self.fail_reason}）")
         if "ui" in keys:
@@ -272,6 +301,14 @@ class Watchdog:
         if "ilink" in keys:
             out.append(f"WeChatAppEx 里的 ILink 服务 {ago(now - self.ilink_gone)}没在跑")
         return out
+
+    def advice(self, keys: list[str] | None = None) -> str:
+        """卡住时给人看的下一步"""
+        keys = self.keys if keys is None else keys
+        if NO_NUDGE & set(keys):
+            return ("这种情况自动唤醒没用，看门狗不会去唤醒。在电脑的终端里运行 docker restart wechat"
+                    "（重启容器，不是重建），等微信自己起来、登录回来，手机上可能要点一下确认")
+        return "一直不好的话：打开网页桌面，在微信窗口上动一下鼠标，一两分钟后多半就恢复了"
 
     def diag(self) -> str:
         """一行现场：界面、X、进程、最后一次入站（只有个数、时间和有没有）"""
@@ -299,6 +336,7 @@ class Watchdog:
             "for": ago(now - self.since) if self.since else "", "reasons": self.reasons(now) if state in STALLED else [],
             "last_inbound": self.last_inbound, "last_inbound_text": clock(self.last_inbound) if self.last_inbound else "",
             "last_inbound_ago": ago(now - self.last_inbound) if self.last_inbound else "",
+            "advice": self.advice() if state in STALLED else "", "nudging": state in STALLED and not NO_NUDGE & set(self.keys),
             "fails": self.fails, "fail_reason": self.fail_reason, "nudges": self.nudges,
             "last_nudge_ago": ago(now - self.last_nudge) if self.nudges else "",
             "ilink": bool(self.proc.get("ilink")), "stalls": self.stalls,
